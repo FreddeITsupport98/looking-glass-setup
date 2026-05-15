@@ -10,6 +10,8 @@
 set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
+SCRIPT_SOURCE_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+INSTALLED_PATH="/usr/local/bin/looking-glass-setup"
 DRY_RUN=false
 YES=false
 MODE="install"
@@ -84,7 +86,7 @@ confirm_or_exit() {
         return 0
     fi
     echo ""
-    printf "${C_YELLOW}? %s [y/N] ${C_NC}" "$msg"
+    printf "%s? %s [y/N] %s" "$C_YELLOW" "$msg" "$C_NC"
     read -r answer
     case "$answer" in
         [yY]|[yY][eE][sS]) return 0 ;;
@@ -133,6 +135,209 @@ append_apparmor_rule_idempotent() {
     else
         printf '%s\n' "$rule" >> "$file"
     fi
+}
+
+# --- Self-deployment --------------------------------------------------------
+is_script_installed() {
+    if [[ -f "$INSTALLED_PATH" ]] && [[ "$(realpath "$INSTALLED_PATH" 2>/dev/null || echo "")" == "$(realpath "$SCRIPT_SOURCE_PATH" 2>/dev/null || echo "__source__")" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+install_script() {
+    log "INFO" "Deploying script to $INSTALLED_PATH …"
+    if [[ "$DRY_RUN" == true ]]; then
+        log "INFO" "[DRY-RUN] Would copy $SCRIPT_SOURCE_PATH -> $INSTALLED_PATH and chmod +x"
+        return 0
+    fi
+    if [[ ! -f "$SCRIPT_SOURCE_PATH" ]]; then
+        log "ERROR" "Cannot locate source script at $SCRIPT_SOURCE_PATH"
+        return 1
+    fi
+    if cp -f "$SCRIPT_SOURCE_PATH" "$INSTALLED_PATH"; then
+        chmod +x "$INSTALLED_PATH"
+        log "SUCCESS" "Script installed. You can now run: looking-glass-setup [OPTIONS]"
+        install_shell_completions
+    else
+        log "ERROR" "Failed to copy script to $INSTALLED_PATH. Are you root?"
+        return 1
+    fi
+}
+
+remove_script() {
+    log "INFO" "Removing deployed script from $INSTALLED_PATH …"
+    if [[ "$DRY_RUN" == true ]]; then
+        log "INFO" "[DRY-RUN] Would remove $INSTALLED_PATH and desktop entry"
+        return 0
+    fi
+    if [[ -f "$INSTALLED_PATH" ]]; then
+        rm -f "$INSTALLED_PATH"
+        log "SUCCESS" "Removed $INSTALLED_PATH"
+    else
+        log "INFO" "No installed script found at $INSTALLED_PATH."
+    fi
+    # Clean up desktop entry if present
+    if [[ -f /usr/local/share/applications/looking-glass-client.desktop ]]; then
+        rm -f /usr/local/share/applications/looking-glass-client.desktop
+        log "SUCCESS" "Removed desktop shortcut."
+    fi
+    # Clean up shell completions
+    if [[ -f /usr/share/fish/vendor_completions.d/looking-glass-setup.fish ]]; then
+        rm -f /usr/share/fish/vendor_completions.d/looking-glass-setup.fish
+        log "SUCCESS" "Removed Fish completions."
+    fi
+    if [[ -f /usr/share/bash-completion/completions/looking-glass-setup ]]; then
+        rm -f /usr/share/bash-completion/completions/looking-glass-setup
+        log "SUCCESS" "Removed Bash completions."
+    fi
+}
+
+create_desktop_entry() {
+    local desktop_file
+    desktop_file="/usr/local/share/applications/looking-glass-client.desktop"
+    log "INFO" "Creating application-menu shortcut for Looking Glass client…"
+    if [[ "$DRY_RUN" == true ]]; then
+        log "INFO" "[DRY-RUN] Would write $desktop_file"
+        return 0
+    fi
+    mkdir -p "$(dirname "$desktop_file")"
+    cat > "$desktop_file" <<'DESKTOP'
+[Desktop Entry]
+Name=Looking Glass Client
+Comment=Low-latency KVM Frame Relay
+Exec=looking-glass-client
+Type=Application
+Terminal=false
+Icon=video-display
+Categories=System;Emulator;
+DESKTOP
+    log "SUCCESS" "Desktop entry created at $desktop_file"
+}
+
+install_shell_completions() {
+    log "INFO" "Installing shell completions…"
+    if [[ "$DRY_RUN" == true ]]; then
+        log "INFO" "[DRY-RUN] Would install Fish and Bash completions."
+        return 0
+    fi
+
+    # Fish completions
+    local fish_dir="/usr/share/fish/vendor_completions.d"
+    if command -v fish >/dev/null 2>&1 || [[ -d "$(dirname "$fish_dir")" ]]; then
+        if [[ ! -d "$fish_dir" ]]; then
+            mkdir -p "$fish_dir" 2>/dev/null || true
+        fi
+        if [[ -d "$fish_dir" ]]; then
+            cat > "$fish_dir/looking-glass-setup.fish" <<'FISH'
+complete -c looking-glass-setup -l install-script -d "Copy script to /usr/local/bin"
+complete -c looking-glass-setup -l self-remove -d "Remove installed script"
+complete -c looking-glass-setup -l create-shortcut -d "Add .desktop entry"
+complete -c looking-glass-setup -l uninstall -l eject -d "Uninstall Looking Glass"
+complete -c looking-glass-setup -l install-completions -d "Install shell completions"
+complete -c looking-glass-setup -l dry-run -d "Show what would be done"
+complete -c looking-glass-setup -l no-tui -d "Disable TUI prompts"
+complete -c looking-glass-setup -l yes -s y -d "Skip confirmations"
+complete -c looking-glass-setup -l help -s h -d "Show help"
+FISH
+            log "SUCCESS" "Fish completions installed to $fish_dir"
+        else
+            log "WARN" "Could not create $fish_dir; skipping Fish completions."
+        fi
+    else
+        log "INFO" "Fish not detected; skipping Fish completions."
+    fi
+
+    # Bash completions
+    local bash_dir="/usr/share/bash-completion/completions"
+    if command -v bash >/dev/null 2>&1 || [[ -d "$(dirname "$bash_dir")" ]]; then
+        if [[ ! -d "$bash_dir" ]]; then
+            mkdir -p "$bash_dir" 2>/dev/null || true
+        fi
+        if [[ -d "$bash_dir" ]]; then
+            cat > "$bash_dir/looking-glass-setup" <<'BASH'
+_looking_glass_setup_completions() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local opts="--install-script --self-remove --create-shortcut --uninstall --eject --install-completions --dry-run --no-tui --yes -y --help -h"
+    COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+}
+complete -F _looking_glass_setup_completions looking-glass-setup
+BASH
+            log "SUCCESS" "Bash completions installed to $bash_dir"
+        else
+            log "WARN" "Could not create $bash_dir; skipping Bash completions."
+        fi
+    else
+        log "INFO" "Bash completions directory not found; skipping Bash completions."
+    fi
+}
+
+show_main_menu() {
+    local choice
+    local menu_items=()
+    menu_items+=("install" "Install Looking Glass")
+    menu_items+=("uninstall" "Uninstall Looking Glass")
+    menu_items+=("shortcut" "Create Desktop Shortcut")
+    menu_items+=("deploy" "Install Script to PATH")
+    menu_items+=("exit" "Exit")
+    choice="$(tui_menu "Looking Glass Manager" "Select an action:" "${menu_items[@]}")"
+    case "$choice" in
+        install)
+            MODE="install"
+            ;;
+        uninstall)
+            MODE="uninstall"
+            ;;
+        shortcut)
+            if [[ $EUID -ne 0 ]]; then
+                log "ERROR" "This action must be run as root. Please use sudo."
+                exit 1
+            fi
+            create_desktop_entry
+            exit 0
+            ;;
+        deploy)
+            if [[ $EUID -ne 0 ]]; then
+                log "ERROR" "This action must be run as root. Please use sudo."
+                exit 1
+            fi
+            install_script
+            exit 0
+            ;;
+        exit|"")
+            log "INFO" "Exiting."
+            exit 0
+            ;;
+    esac
+}
+
+maybe_prompt_install() {
+    if is_script_installed; then
+        return 0
+    fi
+    if [[ "$YES" == true ]]; then
+        install_script
+        return 0
+    fi
+    if [[ "$TUI_BACKEND" != "none" && "$TUI_BACKEND" != "" ]]; then
+        if tui_yesno "Deploy Script" "Install this script to $INSTALLED_PATH so you can run it from anywhere?"; then
+            install_script
+        else
+            log "INFO" "Running from source without installing."
+        fi
+        return 0
+    fi
+    echo ""
+    printf "%s? Install this script to %s so you can run it from anywhere? [y/N] %s" "$C_YELLOW" "$INSTALLED_PATH" "$C_NC"
+    read -r answer
+    case "$answer" in
+        [yY]|[yY][eE][sS])
+            install_script
+            ;;
+        *)
+            log "INFO" "Running from source without installing."
+            ;;
+    esac
 }
 
 # --- TUI Helpers ------------------------------------------------------------
@@ -611,6 +816,7 @@ do_install() {
     setup_security
     generate_user_config
     configure_libvirt_vm
+    install_shell_completions
 
     log "SUCCESS" "Installation complete! You can now run 'looking-glass-client'."
 }
@@ -728,6 +934,22 @@ parse_args() {
                 MODE="uninstall"
                 shift
                 ;;
+            --install-script)
+                install_script
+                exit 0
+                ;;
+            --self-remove)
+                remove_script
+                exit 0
+                ;;
+            --create-shortcut)
+                create_desktop_entry
+                exit 0
+                ;;
+            --install-completions)
+                install_shell_completions
+                exit 0
+                ;;
             --no-tui)
                 NO_TUI=true
                 shift
@@ -745,6 +967,10 @@ parse_args() {
 Usage: sudo ./${SCRIPT_NAME} [OPTIONS]
 
 Options:
+  --install-script       Copy this script to $INSTALLED_PATH.
+  --self-remove          Remove the installed script from $INSTALLED_PATH.
+  --create-shortcut      Add a .desktop entry for looking-glass-client.
+  --install-completions  Install Fish and Bash shell completions.
   --uninstall, --eject   Uninstall Looking Glass and remove shared-memory config.
   --dry-run              Show what would be done without touching the system.
   --no-tui               Disable TUI (whiptail/dialog) and use plain text prompts.
@@ -765,10 +991,31 @@ EOF
 parse_args "$@"
 detect_tui_backend
 log "INFO" "Starting Looking Glass Manager (mode: ${MODE})…"
-detect_environment
+
+# Show interactive main menu when no explicit mode or action was requested
+if [[ "$MODE" == "install" && "$NO_TUI" == false && "$DRY_RUN" == false && "$YES" == false && "$TUI_BACKEND" != "none" && "$TUI_BACKEND" != "" ]]; then
+    show_main_menu
+fi
 
 if [[ "$MODE" == "uninstall" ]]; then
+    detect_environment
     do_uninstall
+    if is_script_installed && [[ "$YES" != true ]]; then
+        if [[ "$TUI_BACKEND" != "none" && "$TUI_BACKEND" != "" ]]; then
+            if tui_yesno "Self-Remove" "Also remove this script ($INSTALLED_PATH)?"; then
+                remove_script
+            fi
+        else
+            echo ""
+            printf "%s? Also remove this script (%s)? [y/N] %s" "$C_YELLOW" "$INSTALLED_PATH" "$C_NC"
+            read -r answer
+            case "$answer" in
+                [yY]|[yY][eE][sS]) remove_script ;;
+            esac
+        fi
+    fi
 else
+    detect_environment
+    maybe_prompt_install
     do_install
 fi
