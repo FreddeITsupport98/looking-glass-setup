@@ -14,6 +14,8 @@ DRY_RUN=false
 YES=false
 MODE="install"
 LOG_FILE="/var/log/looking-glass-setup.log"
+NO_TUI=false
+TUI_BACKEND="none"
 
 # --- Colors -----------------------------------------------------------------
 C_RED='\033[0;31m'
@@ -74,6 +76,13 @@ confirm_or_exit() {
     if [[ "$YES" == true ]]; then
         return 0
     fi
+    if [[ "$TUI_BACKEND" != "none" && "$TUI_BACKEND" != "" ]]; then
+        if ! tui_yesno "Looking Glass Setup" "$msg"; then
+            log "WARN" "Aborted by user."
+            exit 0
+        fi
+        return 0
+    fi
     echo ""
     printf "${C_YELLOW}? %s [y/N] ${C_NC}" "$msg"
     read -r answer
@@ -124,6 +133,70 @@ append_apparmor_rule_idempotent() {
     else
         printf '%s\n' "$rule" >> "$file"
     fi
+}
+
+# --- TUI Helpers ------------------------------------------------------------
+detect_tui_backend() {
+    if [[ "$NO_TUI" == true || "$YES" == true || "$DRY_RUN" == true ]]; then
+        TUI_BACKEND="none"
+        return
+    fi
+    if command -v whiptail >/dev/null 2>&1; then
+        TUI_BACKEND="whiptail"
+    elif command -v dialog >/dev/null 2>&1; then
+        TUI_BACKEND="dialog"
+    else
+        TUI_BACKEND="none"
+    fi
+}
+
+tui_yesno() {
+    local title="$1"
+    local text="$2"
+    case "$TUI_BACKEND" in
+        whiptail)
+            whiptail --title "$title" --yesno "$text" 10 60
+            ;;
+        dialog)
+            dialog --title "$title" --yesno "$text" 10 60
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+tui_menu() {
+    local title="$1"
+    local text="$2"
+    shift 2
+    local result=""
+    case "$TUI_BACKEND" in
+        whiptail)
+            result=$(whiptail --title "$title" --menu "$text" 20 70 10 "$@" 3>&1 1>&2 2>&3) || true
+            ;;
+        dialog)
+            result=$(dialog --title "$title" --menu "$text" 20 70 10 "$@" 3>&1 1>&2 2>&3) || true
+            ;;
+        *)
+            log "INFO" "$text"
+            local i=1
+            local tags=() items=()
+            while [[ $# -gt 0 ]]; do
+                tags+=("$1")
+                items+=("$2")
+                printf "  %d) %s\n" "$i" "$2"
+                shift 2
+                i=$((i+1))
+            done
+            read -rp "Enter number (or leave blank to cancel): " choice
+            [[ -z "$choice" ]] && { printf ''; return; }
+            if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 && "$choice" -le ${#tags[@]} ]]; then
+                result="${tags[$((choice-1))]}"
+            fi
+            ;;
+    esac
+    printf '%s' "$result"
 }
 
 # --- Core Functions ---------------------------------------------------------
@@ -211,14 +284,102 @@ preflight_hardware() {
 }
 
 detect_display_server() {
-    local display_type
-    display_type="x11"
-    if [[ -n "${REAL_USER:-}" && "$REAL_USER" != "root" ]]; then
-        if sudo -u "$REAL_USER" bash -c 'echo "$XDG_SESSION_TYPE"' 2>/dev/null | grep -iq "wayland"; then
-            display_type="wayland"
+    local display_type="x11"
+    if command -v loginctl >/dev/null 2>&1 && [[ -n "${REAL_USER:-}" && "$REAL_USER" != "root" ]]; then
+        local session_id
+        session_id="$(loginctl list-sessions --no-legend | awk -v user="$REAL_USER" '$3==user {print $1; exit}')"
+        if [[ -n "$session_id" ]]; then
+            local session_type
+            session_type="$(loginctl show-session "$session_id" -p Type --value 2>/dev/null || true)"
+            if [[ "${session_type,,}" == "wayland" ]]; then
+                display_type="wayland"
+            fi
         fi
     fi
     printf '%s' "$display_type"
+}
+
+compile_from_source() {
+    local src_url src_dir build_dir
+    src_dir="/tmp/looking-glass-setup-src"
+    build_dir="$src_dir/client/build"
+
+    if [[ -x /usr/local/bin/looking-glass-client ]]; then
+        log "SUCCESS" "looking-glass-client already present in /usr/local/bin/."
+        return 0
+    fi
+
+    if [[ -n "${LOOKING_GLASS_SRC_URL:-}" ]]; then
+        src_url="$LOOKING_GLASS_SRC_URL"
+    else
+        log "INFO" "Resolving latest Looking Glass release…"
+        if command -v curl >/dev/null 2>&1; then
+            src_url=$(curl -fsSL -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/gnif/LookingGlass/releases/latest" 2>/dev/null \
+                | awk '/"tarball_url":/ {gsub(/[",]/,""); print $2; exit}')
+        fi
+        if [[ -z "$src_url" ]] && command -v wget >/dev/null 2>&1; then
+            src_url=$(wget -qO- -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/gnif/LookingGlass/releases/latest" 2>/dev/null \
+                | awk '/"tarball_url":/ {gsub(/[",]/,""); print $2; exit}')
+        fi
+        if [[ -z "$src_url" ]]; then
+            log "WARN" "Could not resolve latest release dynamically. Falling back to B7."
+            src_url="https://github.com/gnif/LookingGlass/releases/download/B7/looking-glass-B7.tar.gz"
+        fi
+    fi
+
+    log "INFO" "Downloading Looking Glass source…"
+    if [[ "$DRY_RUN" == true ]]; then
+        log "INFO" "[DRY-RUN] Would download $src_url, build, and install to /usr/local/bin/"
+        return 0
+    fi
+
+    rm -rf "$src_dir"
+    mkdir -p "$src_dir"
+
+    if command -v curl >/dev/null 2>&1; then
+        if ! curl -fsSL -L "$src_url" -o "$src_dir/looking-glass.tar.gz"; then
+            log "ERROR" "Failed to download Looking Glass source."
+            rm -rf "$src_dir"
+            return 1
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        if ! wget -q "$src_url" -O "$src_dir/looking-glass.tar.gz"; then
+            log "ERROR" "Failed to download Looking Glass source."
+            rm -rf "$src_dir"
+            return 1
+        fi
+    else
+        log "ERROR" "Neither curl nor wget is installed. Cannot download source."
+        return 1
+    fi
+
+    log "INFO" "Extracting source…"
+    if ! tar -xzf "$src_dir/looking-glass.tar.gz" -C "$src_dir" --strip-components=1; then
+        log "ERROR" "Failed to extract source archive."
+        rm -rf "$src_dir"
+        return 1
+    fi
+
+    log "INFO" "Building Looking Glass client…"
+    mkdir -p "$build_dir"
+    if ! (cd "$build_dir" && cmake ../ && make -j"$(nproc)"); then
+        log "ERROR" "Build failed. Check dependencies and try again."
+        rm -rf "$src_dir"
+        return 1
+    fi
+
+    log "INFO" "Installing binary to /usr/local/bin/…"
+    if ! cp "$build_dir/looking-glass-client" /usr/local/bin/looking-glass-client; then
+        log "ERROR" "Failed to install binary to /usr/local/bin/."
+        rm -rf "$src_dir"
+        return 1
+    fi
+    chmod +x /usr/local/bin/looking-glass-client
+
+    rm -rf "$src_dir"
+    log "SUCCESS" "looking-glass-client compiled and installed."
 }
 
 setup_shared_memory() {
@@ -257,6 +418,59 @@ setup_security() {
     fi
 }
 
+merge_ini_setting() {
+    local file section key value
+    file="$1"
+    section="$2"
+    key="$3"
+    value="$4"
+    if [[ "$DRY_RUN" == true ]]; then
+        log "INFO" "[DRY-RUN] Would ensure [$section] $key=$value in $file"
+        return 0
+    fi
+    if [[ ! -f "$file" ]]; then
+        printf "[%s]\n%s=%s\n" "$section" "$key" "$value" > "$file"
+        return 0
+    fi
+
+    if ! grep -q "^\[${section}\]$" "$file"; then
+        printf "\n[%s]\n%s=%s\n" "$section" "$key" "$value" >> "$file"
+        return 0
+    fi
+
+    local in_section=false
+    local key_exists=false
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "[$section]" ]]; then
+            in_section=true
+            continue
+        fi
+        if [[ "$in_section" == true && "$line" =~ ^\[.*\]$ ]]; then
+            break
+        fi
+        if [[ "$in_section" == true && "$line" == "$key="* ]]; then
+            key_exists=true
+            break
+        fi
+    done < "$file" || true
+
+    if [[ "$key_exists" == true ]]; then
+        return 0
+    fi
+
+    local tmp_file
+    tmp_file="$(mktemp)"
+    local inserted=false
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        printf '%s\n' "$line" >> "$tmp_file"
+        if [[ "$inserted" == false && "$line" == "[$section]" ]]; then
+            printf '%s=%s\n' "$key" "$value" >> "$tmp_file"
+            inserted=true
+        fi
+    done < "$file"
+    mv "$tmp_file" "$file"
+}
+
 generate_user_config() {
     local USER_HOME
     local CONF_FILE
@@ -265,38 +479,87 @@ generate_user_config() {
     if [[ -n "${REAL_USER:-}" && "$REAL_USER" != "root" ]]; then
         USER_HOME="$(getent passwd "$REAL_USER" | cut -d: -f6)"
         CONF_FILE="$USER_HOME/.looking-glass-client.ini"
-        if [[ ! -f "$CONF_FILE" ]]; then
-            display_type="$(detect_display_server)"
-            log "INFO" "Generating $display_type optimized configuration for $REAL_USER…"
-            if [[ "$DRY_RUN" == false ]]; then
-                if [[ "$display_type" == "wayland" ]]; then
-                    cat <<'CONFEOF' > "$CONF_FILE"
-[app]
-shmFile=/dev/shm/looking-glass
-
-[spice]
-enable=yes
-audio=yes
-
-[wayland]
-fractionalScale=yes
-CONFEOF
-                else
-                    cat <<'CONFEOF' > "$CONF_FILE"
-[app]
-shmFile=/dev/shm/looking-glass
-
-[spice]
-enable=yes
-audio=yes
-CONFEOF
-                fi
-                chown "$REAL_USER":"$REAL_USER" "$CONF_FILE"
+        display_type="$(detect_display_server)"
+        log "INFO" "Ensuring configuration for $REAL_USER (display: $display_type)…"
+        if [[ "$DRY_RUN" == false ]]; then
+            if [[ ! -f "$CONF_FILE" ]]; then
+                touch "$CONF_FILE"
             fi
-        else
-            log "SUCCESS" "Configuration file $CONF_FILE already exists, skipping generation."
+            chown "$REAL_USER":"$(id -gn "$REAL_USER")" "$CONF_FILE"
+        fi
+        merge_ini_setting "$CONF_FILE" "app" "shmFile" "/dev/shm/looking-glass"
+        merge_ini_setting "$CONF_FILE" "spice" "enable" "yes"
+        merge_ini_setting "$CONF_FILE" "spice" "audio" "yes"
+        if [[ "$display_type" == "wayland" ]]; then
+            merge_ini_setting "$CONF_FILE" "wayland" "fractionalScale" "yes"
         fi
     fi
+}
+
+configure_libvirt_vm() {
+    local vm_list selected_vm
+    if ! command -v virsh >/dev/null 2>&1; then
+        log "INFO" "virsh not found. Skipping libvirt VM configuration."
+        return 0
+    fi
+    if ! virsh list --all >/dev/null 2>&1; then
+        log "WARN" "Cannot connect to libvirt. Skipping VM configuration."
+        return 0
+    fi
+
+    log "INFO" "Scanning libvirt virtual machines…"
+    mapfile -t vm_list < <(virsh list --all --name | grep -v '^$' || true)
+    if [[ ${#vm_list[@]} -eq 0 ]]; then
+        log "WARN" "No libvirt VMs found. Skipping VM configuration."
+        return 0
+    fi
+
+    local menu_items=()
+    local vm
+    for vm in "${vm_list[@]}"; do
+        local state
+        state="$(virsh domstate "$vm" 2>/dev/null || echo "unknown")"
+        menu_items+=("$vm" "$state")
+    done
+
+    # Add a skip option
+    menu_items+=("__SKIP__" "Skip VM configuration")
+
+    selected_vm="$(tui_menu "Select VM" "Which VM should have the Looking Glass shared memory device attached?" "${menu_items[@]}")"
+    if [[ -z "$selected_vm" || "$selected_vm" == "__SKIP__" ]]; then
+        log "INFO" "Skipping VM XML automation."
+        return 0
+    fi
+
+    log "INFO" "Targeting VM: $selected_vm"
+
+    log "INFO" "Checking VM '$selected_vm' for existing shmem device…"
+    if virsh dumpxml "$selected_vm" 2>/dev/null | grep -q "model type='ivshmem-plain'"; then
+        log "SUCCESS" "VM '$selected_vm' already has an ivshmem-plain device attached."
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log "INFO" "[DRY-RUN] Would attach shmem device to VM '$selected_vm'."
+        return 0
+    fi
+
+    local tmp_xml
+    tmp_xml="$(mktemp)"
+    cat > "$tmp_xml" <<'XMLEOF'
+<shmem name='looking-glass'>
+  <model type='ivshmem-plain'/>
+  <size unit='M'>32</size>
+</shmem>
+XMLEOF
+
+    log "INFO" "Attaching Looking Glass shmem device to VM '$selected_vm'…"
+    if virsh attach-device --config "$selected_vm" "$tmp_xml" >/dev/null 2>&1; then
+        log "SUCCESS" "Successfully injected <shmem> hardware into VM '$selected_vm'."
+    else
+        log "WARN" "Failed to attach shmem device to VM '$selected_vm'. You may need to add it manually."
+    fi
+    rm -f "$tmp_xml"
 }
 
 do_install() {
@@ -321,7 +584,9 @@ do_install() {
 
     elif command -v pacman >/dev/null 2>&1; then
         log "INFO" "Detected Arch Linux (pacman)"
-        run_or_simulate pacman -S --noconfirm --needed base-devel
+        run_or_simulate pacman -S --noconfirm --needed base-devel cmake gcc pkgconf sdl2 sdl2_ttf \
+        spice-protocol fontconfig gmp wayland-protocols libx11 libxext libxfixes libxi \
+        libxinerama libxss libxcursor libxpresent libxkbcommon libglvnd
         if ! pacman -Q looking-glass >/dev/null 2>&1; then
             if command -v yay >/dev/null 2>&1 && [[ -n "$REAL_USER" && "$REAL_USER" != "root" ]]; then
                 log "INFO" "Installing looking-glass from AUR via yay as user $REAL_USER…"
@@ -340,12 +605,12 @@ do_install() {
         log "INFO" "Detected Ubuntu/Debian (apt)"
         log "INFO" "Installing all required build dependencies…"
         run_or_simulate apt-get update
-        run_or_simulate apt-get install -y binutils-dev cmake fonts-freefont-ttf libsdl2-dev libsdl2-ttf-dev \
-        libspice-protocol-dev libfontconfig1-dev libgmp-dev libwayland-dev \
-        wayland-protocols libx11-dev libxext-dev libxfixes-dev libxi-dev \
+        run_or_simulate apt-get install -y build-essential pkg-config binutils-dev cmake fonts-freefont-ttf \
+        libsdl2-dev libsdl2-ttf-dev libspice-protocol-dev libfontconfig1-dev libgmp-dev \
+        libwayland-dev wayland-protocols libx11-dev libxext-dev libxfixes-dev libxi-dev \
         libxinerama-dev libxss-dev libxcursor-dev libxpresent-dev libxkbcommon-dev \
         libglvnd-dev libegl1-mesa-dev
-        log "WARN" "Dependencies installed. You will need to compile the client from source (check looking-glass.io)."
+        compile_from_source
     else
         log "ERROR" "Unsupported package manager. Please install manually."
         exit 1
@@ -354,6 +619,7 @@ do_install() {
     setup_shared_memory
     setup_security
     generate_user_config
+    configure_libvirt_vm
 
     log "SUCCESS" "Installation complete! You can now run 'looking-glass-client'."
 }
@@ -450,6 +716,10 @@ parse_args() {
                 MODE="uninstall"
                 shift
                 ;;
+            --no-tui)
+                NO_TUI=true
+                shift
+                ;;
             --dry-run)
                 DRY_RUN=true
                 shift
@@ -465,6 +735,7 @@ Usage: sudo ./${SCRIPT_NAME} [OPTIONS]
 Options:
   --uninstall, --eject   Uninstall Looking Glass and remove shared-memory config.
   --dry-run              Show what would be done without touching the system.
+  --no-tui               Disable TUI (whiptail/dialog) and use plain text prompts.
   --yes, -y              Skip confirmation prompts (use with caution!).
   --help, -h             Show this help text.
 EOF
@@ -480,6 +751,7 @@ EOF
 
 # --- Main -------------------------------------------------------------------
 parse_args "$@"
+detect_tui_backend
 log "INFO" "Starting Looking Glass Manager (mode: ${MODE})…"
 detect_environment
 
