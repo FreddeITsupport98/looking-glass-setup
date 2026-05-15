@@ -286,21 +286,22 @@ preflight_hardware() {
 detect_display_server() {
     local display_type="x11"
     if command -v loginctl >/dev/null 2>&1 && [[ -n "${REAL_USER:-}" && "$REAL_USER" != "root" ]]; then
-        local session_id
-        session_id="$(loginctl list-sessions --no-legend | awk -v user="$REAL_USER" '$3==user {print $1; exit}')"
-        if [[ -n "$session_id" ]]; then
-            local session_type
-            session_type="$(loginctl show-session "$session_id" -p Type --value 2>/dev/null || true)"
+        local session_ids
+        session_ids="$(loginctl list-sessions --no-legend | awk -v user="$REAL_USER" '$3==user {print $1}')"
+        local sid session_type
+        for sid in $session_ids; do
+            session_type="$(loginctl show-session "$sid" -p Type --value 2>/dev/null || true)"
             if [[ "${session_type,,}" == "wayland" ]]; then
                 display_type="wayland"
+                break
             fi
-        fi
+        done
     fi
     printf '%s' "$display_type"
 }
 
 compile_from_source() {
-    local src_url src_dir build_dir
+    local src_dir build_dir
     src_dir="/tmp/looking-glass-setup-src"
     build_dir="$src_dir/client/build"
 
@@ -309,55 +310,20 @@ compile_from_source() {
         return 0
     fi
 
-    if [[ -n "${LOOKING_GLASS_SRC_URL:-}" ]]; then
-        src_url="$LOOKING_GLASS_SRC_URL"
-    else
-        log "INFO" "Resolving latest Looking Glass release…"
-        if command -v curl >/dev/null 2>&1; then
-            src_url=$(curl -fsSL -H "Accept: application/vnd.github.v3+json" \
-                "https://api.github.com/repos/gnif/LookingGlass/releases/latest" 2>/dev/null \
-                | awk '/"tarball_url":/ {gsub(/[",]/,""); print $2; exit}')
-        fi
-        if [[ -z "$src_url" ]] && command -v wget >/dev/null 2>&1; then
-            src_url=$(wget -qO- -H "Accept: application/vnd.github.v3+json" \
-                "https://api.github.com/repos/gnif/LookingGlass/releases/latest" 2>/dev/null \
-                | awk '/"tarball_url":/ {gsub(/[",]/,""); print $2; exit}')
-        fi
-        if [[ -z "$src_url" ]]; then
-            log "WARN" "Could not resolve latest release dynamically. Falling back to B7."
-            src_url="https://github.com/gnif/LookingGlass/releases/download/B7/looking-glass-B7.tar.gz"
-        fi
-    fi
-
-    log "INFO" "Downloading Looking Glass source…"
+    log "INFO" "Cloning Looking Glass source and submodules…"
     if [[ "$DRY_RUN" == true ]]; then
-        log "INFO" "[DRY-RUN] Would download $src_url, build, and install to /usr/local/bin/"
+        log "INFO" "[DRY-RUN] Would git clone --recurse-submodules and install to /usr/local/bin/"
         return 0
     fi
 
-    rm -rf "$src_dir"
-    mkdir -p "$src_dir"
-
-    if command -v curl >/dev/null 2>&1; then
-        if ! curl -fsSL -L "$src_url" -o "$src_dir/looking-glass.tar.gz"; then
-            log "ERROR" "Failed to download Looking Glass source."
-            rm -rf "$src_dir"
-            return 1
-        fi
-    elif command -v wget >/dev/null 2>&1; then
-        if ! wget -q "$src_url" -O "$src_dir/looking-glass.tar.gz"; then
-            log "ERROR" "Failed to download Looking Glass source."
-            rm -rf "$src_dir"
-            return 1
-        fi
-    else
-        log "ERROR" "Neither curl nor wget is installed. Cannot download source."
+    if ! command -v git >/dev/null 2>&1; then
+        log "ERROR" "git is not installed. Cannot download source code."
         return 1
     fi
 
-    log "INFO" "Extracting source…"
-    if ! tar -xzf "$src_dir/looking-glass.tar.gz" -C "$src_dir" --strip-components=1; then
-        log "ERROR" "Failed to extract source archive."
+    rm -rf "$src_dir"
+    if ! git clone --recurse-submodules https://github.com/gnif/LookingGlass.git "$src_dir"; then
+        log "ERROR" "Failed to clone Looking Glass repository."
         rm -rf "$src_dir"
         return 1
     fi
@@ -396,9 +362,18 @@ setup_security() {
 
     if command -v getenforce >/dev/null 2>&1 && command -v chcon >/dev/null 2>&1; then
         selinux_state="$(getenforce)"
-        if [[ "$selinux_state" != "Disabled" && -e /dev/shm/looking-glass ]]; then
-            log "INFO" "Applying SELinux context to shared memory…"
-            run_or_simulate chcon -t svirt_tmpfs_t /dev/shm/looking-glass || true
+        if [[ "$selinux_state" != "Disabled" ]]; then
+            if [[ -e /dev/shm/looking-glass ]]; then
+                log "INFO" "Applying SELinux context to shared memory…"
+                run_or_simulate chcon -t svirt_tmpfs_t /dev/shm/looking-glass || true
+            fi
+            if command -v semanage >/dev/null 2>&1; then
+                if [[ "$DRY_RUN" == false ]]; then
+                    semanage fcontext -a -t svirt_tmpfs_t "/dev/shm/looking-glass" 2>/dev/null || true
+                fi
+            else
+                log "WARN" "'semanage' not found. SELinux context will not survive a reboot. Install policycoreutils-python-utils for persistence."
+            fi
         fi
     fi
 
@@ -549,13 +524,14 @@ configure_libvirt_vm() {
     cat > "$tmp_xml" <<'XMLEOF'
 <shmem name='looking-glass'>
   <model type='ivshmem-plain'/>
-  <size unit='M'>32</size>
+  <size unit='M'>64</size>
 </shmem>
 XMLEOF
 
     log "INFO" "Attaching Looking Glass shmem device to VM '$selected_vm'…"
     if virsh attach-device --config "$selected_vm" "$tmp_xml" >/dev/null 2>&1; then
         log "SUCCESS" "Successfully injected <shmem> hardware into VM '$selected_vm'."
+        log "WARN" "IMPORTANT: If '$selected_vm' is currently running, you MUST fully shut it down (not just restart) for the new hardware to appear."
     else
         log "WARN" "Failed to attach shmem device to VM '$selected_vm'. You may need to add it manually."
     fi
@@ -702,6 +678,27 @@ do_uninstall() {
             if command -v systemctl >/dev/null 2>&1; then
                 run_or_simulate systemctl reload apparmor || true
             fi
+        fi
+    fi
+
+    # VM Orphan Hardware Check
+    if command -v virsh >/dev/null 2>&1; then
+        local orphan_vms=()
+        local vm_name
+        while IFS= read -r vm_name; do
+            [[ -z "$vm_name" ]] && continue
+            if virsh dumpxml "$vm_name" 2>/dev/null | grep -q "model type='ivshmem-plain'"; then
+                orphan_vms+=("$vm_name")
+            fi
+        done < <(virsh list --all --name 2>/dev/null || true)
+
+        if [[ ${#orphan_vms[@]} -gt 0 ]]; then
+            log "ERROR" "CRITICAL: The following VMs still have the Looking Glass memory device attached:"
+            for vm_name in "${orphan_vms[@]}"; do
+                log "ERROR" "  -> $vm_name"
+            done
+            log "WARN" "You MUST manually remove the 'ivshmem' device from these VMs in virt-manager."
+            log "WARN" "If you do not remove it, the VMs will refuse to boot because the shared memory file is gone!"
         fi
     fi
 
