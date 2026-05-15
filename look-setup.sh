@@ -146,6 +146,7 @@ is_script_installed() {
 }
 
 install_script() {
+    detect_tui_backend
     log "INFO" "Deploying script to $INSTALLED_PATH …"
     if [[ "$DRY_RUN" == true ]]; then
         log "INFO" "[DRY-RUN] Would copy $SCRIPT_SOURCE_PATH -> $INSTALLED_PATH and chmod +x"
@@ -158,7 +159,17 @@ install_script() {
     if cp -f "$SCRIPT_SOURCE_PATH" "$INSTALLED_PATH"; then
         chmod +x "$INSTALLED_PATH"
         log "SUCCESS" "Script installed. You can now run: looking-glass-setup [OPTIONS]"
+        log "INFO" "TUI backend: ${TUI_BACKEND}"
         install_shell_completions
+        log "INFO" ""
+        log "INFO" "Quick reference for installed command:"
+        log "INFO" "  sudo looking-glass-setup              # Interactive TUI menu"
+        log "INFO" "  sudo looking-glass-setup --install    # Install Looking Glass"
+        log "INFO" "  sudo looking-glass-setup --uninstall    # Uninstall Looking Glass"
+        log "INFO" "  sudo looking-glass-setup --self-remove  # Remove this script from PATH"
+        log "INFO" "  sudo looking-glass-setup --dry-run      # Preview changes without applying"
+        log "INFO" "  sudo looking-glass-setup --yes          # Skip all confirmation prompts"
+        log "INFO" "  sudo looking-glass-setup --help         # Show full help"
     else
         log "ERROR" "Failed to copy script to $INSTALLED_PATH. Are you root?"
         return 1
@@ -172,8 +183,12 @@ remove_script() {
         return 0
     fi
     if [[ -f "$INSTALLED_PATH" ]]; then
-        rm -f "$INSTALLED_PATH"
-        log "SUCCESS" "Removed $INSTALLED_PATH"
+        if rm -f "$INSTALLED_PATH"; then
+            log "SUCCESS" "Removed $INSTALLED_PATH"
+        else
+            log "ERROR" "Failed to remove $INSTALLED_PATH. Are you root?"
+            return 1
+        fi
     else
         log "INFO" "No installed script found at $INSTALLED_PATH."
     fi
@@ -505,14 +520,28 @@ detect_display_server() {
     printf '%s' "$display_type"
 }
 
+is_lg_binary_valid() {
+    local bin="$1"
+    [[ -f "$bin" && -s "$bin" ]] || return 1
+    if command -v file >/dev/null 2>&1; then
+        file "$bin" | grep -q "ELF" || return 1
+    fi
+    return 0
+}
+
 compile_from_source() {
     local src_dir build_dir
     src_dir="/tmp/looking-glass-setup-src"
     build_dir="$src_dir/client/build"
 
-    if [[ -x /usr/local/bin/looking-glass-client ]]; then
-        log "SUCCESS" "looking-glass-client already present in /usr/local/bin/."
+    if is_lg_binary_valid /usr/local/bin/looking-glass-client; then
+        log "SUCCESS" "looking-glass-client already present and valid in /usr/local/bin/."
         return 0
+    fi
+
+    if [[ -f /usr/local/bin/looking-glass-client ]]; then
+        log "WARN" "Existing /usr/local/bin/looking-glass-client appears corrupt or incomplete. Removing and recompiling…"
+        rm -f /usr/local/bin/looking-glass-client
     fi
 
     log "INFO" "Cloning Looking Glass source and submodules…"
@@ -534,6 +563,9 @@ compile_from_source() {
     fi
 
     log "INFO" "Building Looking Glass client…"
+    if [[ -d "$build_dir" ]]; then
+        rm -rf "$build_dir"
+    fi
     mkdir -p "$build_dir"
     if ! (cd "$build_dir" && cmake ../ && make -j"$(nproc)"); then
         log "ERROR" "Build failed. Check dependencies and try again."
@@ -767,15 +799,49 @@ do_install() {
     log "INFO" "Detecting package manager for installation…"
     if command -v dnf >/dev/null 2>&1; then
         log "INFO" "Detected Fedora/RHEL (dnf)"
-        if { dnf copr list 2>/dev/null || true; } | grep -q agnelo/looking-glass; then
-            log "SUCCESS" "COPR agnelo/looking-glass already enabled."
+        if [[ -x /usr/local/bin/looking-glass-client ]]; then
+            log "SUCCESS" "looking-glass-client already present."
+        elif rpm -q looking-glass-client >/dev/null 2>&1; then
+            log "SUCCESS" "looking-glass-client already installed via dnf."
         else
-            run_or_simulate dnf copr enable -y agnelo/looking-glass
-        fi
-        if rpm -q looking-glass-client >/dev/null 2>&1; then
-            log "SUCCESS" "looking-glass-client already installed."
-        else
-            run_or_simulate dnf install -y looking-glass-client
+            local copr_worked=false
+            if { dnf copr list 2>/dev/null || true; } | grep -q agnelo/looking-glass; then
+                log "SUCCESS" "COPR agnelo/looking-glass already enabled."
+                copr_worked=true
+            elif [[ "$DRY_RUN" == true ]]; then
+                log "INFO" "[DRY-RUN] Would run: dnf copr enable -y agnelo/looking-glass"
+                copr_worked=true
+            elif dnf copr enable -y agnelo/looking-glass >/dev/null 2>&1; then
+                log "SUCCESS" "COPR agnelo/looking-glass enabled."
+                copr_worked=true
+            else
+                log "WARN" "COPR agnelo/looking-glass is unavailable for this release."
+            fi
+
+            if [[ "$copr_worked" == true ]]; then
+                if [[ "$DRY_RUN" == true ]]; then
+                    log "INFO" "[DRY-RUN] Would run: dnf install -y looking-glass-client"
+                elif dnf install -y looking-glass-client >/dev/null 2>&1; then
+                    log "SUCCESS" "looking-glass-client installed via dnf."
+                else
+                    log "WARN" "dnf install failed. Will try source compilation."
+                    copr_worked=false
+                fi
+            fi
+
+            if [[ "$copr_worked" == false ]]; then
+                log "INFO" "Installing build dependencies for source compilation…"
+                if [[ "$DRY_RUN" == true ]]; then
+                    log "INFO" "[DRY-RUN] Would install Fedora build deps and compile from source."
+                else
+                    local fedora_deps=(cmake gcc gcc-c++ git mesa-libEGL-devel SDL2-devel SDL2_ttf-devel fontconfig-devel gmp-devel libglvnd-devel libX11-devel libXcursor-devel libXext-devel libXfixes-devel libXi-devel libXinerama-devel libXpresent-devel libxkbcommon-devel libwayland-client-devel wayland-protocols-devel spice-protocol)
+                    if dnf install -y "${fedora_deps[@]}" >/dev/null 2>&1; then
+                        compile_from_source
+                    else
+                        log "WARN" "Failed to install build dependencies. Please install them manually and re-run."
+                    fi
+                fi
+            fi
         fi
 
     elif command -v pacman >/dev/null 2>&1; then
@@ -875,6 +941,18 @@ do_uninstall() {
         fi
     elif command -v apt >/dev/null 2>&1; then
         log "INFO" "Note: On Ubuntu, LG is usually compiled from source. Dependencies remain installed."
+    fi
+
+    if [[ -f /usr/local/bin/looking-glass-client ]]; then
+        log "INFO" "Removing compiled looking-glass-client binary…"
+        run_or_simulate rm -f /usr/local/bin/looking-glass-client
+        log "SUCCESS" "Removed /usr/local/bin/looking-glass-client"
+    fi
+
+    if [[ -f /usr/local/share/applications/looking-glass-client.desktop ]]; then
+        log "INFO" "Removing desktop shortcut…"
+        run_or_simulate rm -f /usr/local/share/applications/looking-glass-client.desktop
+        log "SUCCESS" "Removed desktop shortcut."
     fi
 
     if [[ -n "${REAL_USER:-}" && "$REAL_USER" != "root" ]]; then

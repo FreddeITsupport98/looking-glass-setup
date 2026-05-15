@@ -80,7 +80,7 @@ assert_contains "$out" "Are you root" "install-script requires root"
 
 # Test: --self-remove as non-root should fail
 out=$(bash "$SCRIPT" --self-remove 2>&1 || true)
-assert_contains "$out" "No installed script found" "self-remove detects not installed"
+assert_contains "$out" "Are you root" "self-remove requires root when installed"
 
 echo ""
 echo "--- Test Group: INI Merging (Unit) ---"
