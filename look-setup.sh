@@ -353,7 +353,11 @@ setup_shared_memory() {
     log "INFO" "Configuring persistent shared memory for user: ${REAL_USER:-<unknown>}"
     desired_line="f /dev/shm/looking-glass 0660 ${REAL_USER:-root} ${VIRT_GROUP:-root} -"
     write_tmpfiles_idempotent "/etc/tmpfiles.d/10-looking-glass.conf" "$desired_line"
-    run_or_simulate systemd-tmpfiles --create /etc/tmpfiles.d/10-looking-glass.conf
+    if command -v systemd-tmpfiles >/dev/null 2>&1; then
+        run_or_simulate systemd-tmpfiles --create /etc/tmpfiles.d/10-looking-glass.conf
+    else
+        log "WARN" "systemd-tmpfiles unavailable; shared-memory node will be created on next boot by systemd."
+    fi
 }
 
 setup_security() {
@@ -423,7 +427,7 @@ merge_ini_setting() {
         if [[ "$in_section" == true && "$line" =~ ^\[.*\]$ ]]; then
             break
         fi
-        if [[ "$in_section" == true && "$line" == "$key="* ]]; then
+        if [[ "$in_section" == true && "${line#"$key="}" != "$line" ]]; then
             key_exists=true
             break
         fi
@@ -433,7 +437,11 @@ merge_ini_setting() {
         return 0
     fi
 
-    local tmp_file
+    local tmp_file orig_stat
+    orig_stat=""
+    if [[ -f "$file" ]]; then
+        orig_stat="$(stat -c '%u:%g' "$file" 2>/dev/null || true)"
+    fi
     tmp_file="$(mktemp)"
     local inserted=false
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -444,6 +452,9 @@ merge_ini_setting() {
         fi
     done < "$file"
     mv "$tmp_file" "$file"
+    if [[ -n "$orig_stat" ]]; then
+        chown "$orig_stat" "$file" 2>/dev/null || true
+    fi
 }
 
 generate_user_config() {
@@ -490,21 +501,22 @@ configure_libvirt_vm() {
     fi
 
     local menu_items=()
-    local vm
+    local vm i=1
     for vm in "${vm_list[@]}"; do
         local state
         state="$(virsh domstate "$vm" 2>/dev/null || echo "unknown")"
-        menu_items+=("$vm" "$state")
+        menu_items+=("$i" "$vm ($state)")
+        i=$((i+1))
     done
+    menu_items+=("0" "Skip VM configuration")
 
-    # Add a skip option
-    menu_items+=("__SKIP__" "Skip VM configuration")
-
-    selected_vm="$(tui_menu "Select VM" "Which VM should have the Looking Glass shared memory device attached?" "${menu_items[@]}")"
-    if [[ -z "$selected_vm" || "$selected_vm" == "__SKIP__" ]]; then
+    local selected_idx
+    selected_idx="$(tui_menu "Select VM" "Which VM should have the Looking Glass shared memory device attached?" "${menu_items[@]}")"
+    if [[ -z "$selected_idx" || "$selected_idx" == "0" ]]; then
         log "INFO" "Skipping VM XML automation."
         return 0
     fi
+    selected_vm="${vm_list[$((selected_idx-1))]}"
 
     log "INFO" "Targeting VM: $selected_vm"
 
@@ -521,6 +533,8 @@ configure_libvirt_vm() {
 
     local tmp_xml
     tmp_xml="$(mktemp)"
+    # shellcheck disable=SC2064
+    trap "rm -f '$tmp_xml' >/dev/null 2>&1 || true; trap 'log \"WARN\" \"Interrupted by user.\"; exit 130' INT TERM" INT TERM
     cat > "$tmp_xml" <<'XMLEOF'
 <shmem name='looking-glass'>
   <model type='ivshmem-plain'/>
@@ -536,6 +550,7 @@ XMLEOF
         log "WARN" "Failed to attach shmem device to VM '$selected_vm'. You may need to add it manually."
     fi
     rm -f "$tmp_xml"
+    trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
 }
 
 do_install() {
@@ -606,10 +621,10 @@ do_uninstall() {
 
     if pgrep -x looking-glass-client >/dev/null 2>&1; then
         log "INFO" "Stopping looking-glass-client process(es)…"
-        run_or_simulate killall -TERM looking-glass-client || true
+        run_or_simulate pkill -x -TERM looking-glass-client || true
         sleep 1
         if pgrep -x looking-glass-client >/dev/null 2>&1; then
-            run_or_simulate killall -KILL looking-glass-client || true
+            run_or_simulate pkill -x -KILL looking-glass-client || true
         fi
     else
         log "INFO" "No running looking-glass-client process found."
