@@ -334,22 +334,16 @@ maybe_prompt_install() {
         install_script
         return 0
     fi
-    if [[ "$TUI_BACKEND" != "none" && "$TUI_BACKEND" != "" ]]; then
-        if tui_yesno "Deploy Script" "Install this script to $INSTALLED_PATH so you can run it from anywhere?"; then
-            install_script
-        else
-            log "INFO" "Running from source without installing."
-        fi
-        return 0
-    fi
-    echo ""
-    printf "${C_YELLOW}? Install this script to %s so you can run it from anywhere? [y/N] ${C_NC}" "$INSTALLED_PATH"
-    read -r answer
-    case "$answer" in
-        [yY]|[yY][eE][sS])
+
+    local choice
+    choice="$(tui_menu "Deploy Script" "How would you like to run this script?" \
+        "install" "Install to $INSTALLED_PATH" \
+        "source"  "Run from source (do not install)")"
+    case "$choice" in
+        install)
             install_script
             ;;
-        *)
+        source|""|"exit")
             log "INFO" "Running from source without installing."
             ;;
     esac
@@ -363,11 +357,36 @@ detect_tui_backend() {
     fi
     if command -v whiptail >/dev/null 2>&1; then
         TUI_BACKEND="whiptail"
-    elif command -v dialog >/dev/null 2>&1; then
-        TUI_BACKEND="dialog"
-    else
-        TUI_BACKEND="none"
+        return
     fi
+    if command -v dialog >/dev/null 2>&1; then
+        TUI_BACKEND="dialog"
+        return
+    fi
+
+    # Try to auto-install whiptail for interactive menus
+    log "INFO" "No TUI backend found; trying to install whiptail…"
+    if command -v dnf >/dev/null 2>&1; then
+        if dnf install -y newt >/dev/null 2>&1; then
+            TUI_BACKEND="whiptail"
+            log "SUCCESS" "Installed whiptail (newt) for interactive menus."
+            return
+        fi
+    elif command -v apt-get >/dev/null 2>&1; then
+        if apt-get update >/dev/null 2>&1 && apt-get install -y whiptail >/dev/null 2>&1; then
+            TUI_BACKEND="whiptail"
+            log "SUCCESS" "Installed whiptail for interactive menus."
+            return
+        fi
+    elif command -v pacman >/dev/null 2>&1; then
+        if pacman -S --noconfirm --needed libnewt >/dev/null 2>&1; then
+            TUI_BACKEND="whiptail"
+            log "SUCCESS" "Installed whiptail (libnewt) for interactive menus."
+            return
+        fi
+    fi
+
+    TUI_BACKEND="none"
 }
 
 tui_yesno() {
@@ -399,17 +418,20 @@ tui_menu() {
             result=$(dialog --title "$title" --menu "$text" 20 70 10 "$@" 3>&1 1>&2 2>&3) || true
             ;;
         *)
-            log "INFO" "$text"
+            printf "\n" >&2
+            printf "${C_CYAN}━━ %s ━━${C_NC}\n" "$title" >&2
+            printf "  %s\n\n" "$text" >&2
             local i=1
             local tags=() items=()
             while [[ $# -gt 0 ]]; do
                 tags+=("$1")
                 items+=("$2")
-                printf "  %d) %s\n" "$i" "$2"
+                printf "  ${C_YELLOW}%d)${C_NC} %s\n" "$i" "$2" >&2
                 shift 2
                 i=$((i+1))
             done
-            read -rp "Enter number (or leave blank to cancel): " choice
+            printf "\n" >&2
+            read -rp "Enter number (or leave blank to cancel): " choice < /dev/tty
             [[ -z "$choice" ]] && { printf ''; return; }
             if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 && "$choice" -le ${#tags[@]} ]]; then
                 result="${tags[$((choice-1))]}"
