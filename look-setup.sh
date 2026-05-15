@@ -591,10 +591,68 @@ compile_from_source() {
         rm -rf "$build_dir"
     fi
     mkdir -p "$build_dir"
-    if ! (cd "$build_dir" && cmake ../ && make -j"$(nproc)"); then
-        log "ERROR" "Build failed. Check dependencies and try again."
+
+    local build_cmd="make"
+    local cmake_generator="Unix Makefiles"
+    if command -v ninja >/dev/null 2>&1; then
+        build_cmd="ninja"
+        cmake_generator="Ninja"
+    fi
+
+    if ! (cd "$build_dir" && cmake -G "$cmake_generator" ../ >/dev/null 2>&1); then
+        log "ERROR" "CMake configuration failed."
         rm -rf "$src_dir"
         return 1
+    fi
+
+    if [[ "$build_cmd" == "ninja" ]]; then
+        log "INFO" "Using Ninja — native progress will be shown."
+        if ! (cd "$build_dir" && ninja -j"$(nproc)"); then
+            log "ERROR" "Build failed. Check dependencies and try again."
+            rm -rf "$src_dir"
+            return 1
+        fi
+    else
+        log "INFO" "Compiling with progress bar (this may take a few minutes)…"
+        local tmp_out
+        tmp_out=$(mktemp) || { log "ERROR" "Failed to create temporary file."; rm -rf "$src_dir"; return 1; }
+
+        (cd "$build_dir" && make -j"$(nproc)" >"$tmp_out" 2>&1; printf '%s\n' "$?" >"$tmp_out.exit") &
+        local make_pid=$!
+
+        local total_cmds current percent filled empty bar_width
+        bar_width=40
+        total_cmds=$(cd "$build_dir" && make -n -j"$(nproc)" 2>/dev/null | grep -c $'^\t' || true)
+        total_cmds=${total_cmds:-0}
+        if [[ "$total_cmds" -lt 1 ]]; then
+            total_cmds=$(find "$src_dir" -type f \( -name '*.c' -o -name '*.cpp' \) | wc -l)
+        fi
+        [[ "$total_cmds" -lt 1 ]] && total_cmds=200
+
+        while kill -0 "$make_pid" 2>/dev/null; do
+            current=$(wc -l <"$tmp_out" 2>/dev/null || echo 0)
+            percent=$((current * 100 / total_cmds))
+            [[ "$percent" -gt 100 ]] && percent=100
+            filled=$((percent * bar_width / 100))
+            empty=$((bar_width - filled))
+            printf '\r\033[K\033[0;36m[%s%s] %3d%%\033[0m' "$(printf '#%.0s' $(seq 1 $filled))" "$(printf ' %.0s' $(seq 1 $empty))" "$percent"
+            sleep 0.5
+        done
+
+        wait "$make_pid" 2>/dev/null || true
+        local make_exit
+        make_exit=$(cat "$tmp_out.exit" 2>/dev/null || echo 1)
+        rm -f "$tmp_out.exit"
+        printf '\n'
+
+        if [[ "$make_exit" -ne 0 ]]; then
+            cat "$tmp_out"
+            rm -f "$tmp_out"
+            log "ERROR" "Build failed. Check dependencies and try again."
+            rm -rf "$src_dir"
+            return 1
+        fi
+        rm -f "$tmp_out"
     fi
 
     log "INFO" "Installing binary to /usr/local/bin/…"
@@ -858,7 +916,7 @@ do_install() {
                 if [[ "$DRY_RUN" == true ]]; then
                     log "INFO" "[DRY-RUN] Would install Fedora build deps and compile from source."
                 else
-                    local fedora_deps=(cmake gcc gcc-c++ git mesa-libEGL-devel SDL2-devel SDL2_ttf-devel fontconfig-devel gmp-devel libglvnd-devel libX11-devel libXcursor-devel libXext-devel libXfixes-devel libXi-devel libXinerama-devel libXpresent-devel libxkbcommon-devel libwayland-client-devel wayland-protocols-devel spice-protocol)
+            local fedora_deps=(cmake gcc gcc-c++ git make pkgconf ninja-build mesa-libEGL-devel SDL2-devel SDL2_ttf-devel fontconfig-devel gmp-devel libglvnd-devel libX11-devel libXcursor-devel libXext-devel libXfixes-devel libXi-devel libXinerama-devel libXpresent-devel libxkbcommon-devel libXScrnSaver-devel libwayland-client-devel wayland-protocols-devel spice-protocol)
                     if dnf install -y "${fedora_deps[@]}" >/dev/null 2>&1; then
                         compile_from_source
                     else
@@ -891,7 +949,7 @@ do_install() {
         log "INFO" "Detected Ubuntu/Debian (apt)"
         log "INFO" "Installing all required build dependencies…"
         run_or_simulate apt-get update
-        run_or_simulate apt-get install -y build-essential pkg-config binutils-dev cmake fonts-freefont-ttf \
+        run_or_simulate apt-get install -y build-essential pkg-config binutils-dev cmake ninja-build fonts-freefont-ttf \
         libsdl2-dev libsdl2-ttf-dev libspice-protocol-dev libfontconfig1-dev libgmp-dev \
         libwayland-dev wayland-protocols libx11-dev libxext-dev libxfixes-dev libxi-dev \
         libxinerama-dev libxss-dev libxcursor-dev libxpresent-dev libxkbcommon-dev \
