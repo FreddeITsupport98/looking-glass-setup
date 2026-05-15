@@ -86,7 +86,7 @@ confirm_or_exit() {
         return 0
     fi
     echo ""
-    printf "%s? %s [y/N] %s" "$C_YELLOW" "$msg" "$C_NC"
+    printf "${C_YELLOW}? %s [y/N] ${C_NC}" "$msg"
     read -r answer
     case "$answer" in
         [yY]|[yY][eE][sS]) return 0 ;;
@@ -328,7 +328,7 @@ maybe_prompt_install() {
         return 0
     fi
     echo ""
-    printf "%s? Install this script to %s so you can run it from anywhere? [y/N] %s" "$C_YELLOW" "$INSTALLED_PATH" "$C_NC"
+    printf "${C_YELLOW}? Install this script to %s so you can run it from anywhere? [y/N] ${C_NC}" "$INSTALLED_PATH"
     read -r answer
     case "$answer" in
         [yY]|[yY][eE][sS])
@@ -1007,7 +1007,7 @@ if [[ "$MODE" == "uninstall" ]]; then
             fi
         else
             echo ""
-            printf "%s? Also remove this script (%s)? [y/N] %s" "$C_YELLOW" "$INSTALLED_PATH" "$C_NC"
+            printf "${C_YELLOW}? Also remove this script (%s)? [y/N] ${C_NC}" "$INSTALLED_PATH"
             read -r answer
             case "$answer" in
                 [yY]|[yY][eE][sS]) remove_script ;;
