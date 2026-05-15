@@ -905,6 +905,7 @@ do_install() {
     generate_user_config
     configure_libvirt_vm
     install_shell_completions
+    create_desktop_entry
 
     log "SUCCESS" "Installation complete! You can now run 'looking-glass-client'."
 }
