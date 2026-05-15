@@ -49,7 +49,9 @@ log() {
 
     if [[ "$DRY_RUN" == false ]]; then
         timestamp="[$(date +'%Y-%m-%d %H:%M:%S')]"
-        printf "%s %s %s\n" "$timestamp" "$prefix" "$msg" >> "$LOG_FILE" 2>/dev/null || true
+        (
+            printf "%s %s %s\n" "$timestamp" "$prefix" "$msg" >> "$LOG_FILE"
+        ) 2>/dev/null || true
     fi
 }
 
