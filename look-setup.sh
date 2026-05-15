@@ -916,7 +916,7 @@ do_install() {
                 if [[ "$DRY_RUN" == true ]]; then
                     log "INFO" "[DRY-RUN] Would install Fedora build deps and compile from source."
                 else
-            local fedora_deps=(cmake gcc gcc-c++ git make pkgconf ninja-build mesa-libEGL-devel SDL2-devel SDL2_ttf-devel fontconfig-devel gmp-devel libglvnd-devel libX11-devel libXcursor-devel libXext-devel libXfixes-devel libXi-devel libXinerama-devel libXpresent-devel libxkbcommon-devel libXScrnSaver-devel libwayland-client-devel wayland-protocols-devel spice-protocol)
+            local fedora_deps=(cmake gcc gcc-c++ git make pkgconf ninja-build mesa-libEGL-devel sdl2-compat-devel SDL2_ttf-devel fontconfig-devel gmp-devel libglvnd-devel libX11-devel libXcursor-devel libXext-devel libXfixes-devel libXi-devel libXinerama-devel libXpresent-devel libxkbcommon-devel libXScrnSaver-devel libwayland-devel wayland-protocols-devel spice-protocol)
                     if dnf install -y "${fedora_deps[@]}"; then
                         compile_from_source
                     else
