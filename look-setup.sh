@@ -199,6 +199,20 @@ remove_script() {
         rm -f /usr/local/share/applications/looking-glass-client.desktop
         log "SUCCESS" "Removed desktop shortcut."
     fi
+    # Clean up user Desktop copy
+    local target_user target_home desktop_dir
+    target_user="${REAL_USER:-${SUDO_USER:-}}"
+    if [[ -z "$target_user" || "$target_user" == "root" ]]; then
+        target_user="${USER:-}"
+    fi
+    if [[ -n "$target_user" && "$target_user" != "root" ]]; then
+        target_home="$(getent passwd "$target_user" | cut -d: -f6)"
+        desktop_dir="$target_home/Desktop"
+        if [[ -f "$desktop_dir/looking-glass-client.desktop" ]]; then
+            rm -f "$desktop_dir/looking-glass-client.desktop"
+            log "SUCCESS" "Removed desktop shortcut from $desktop_dir."
+        fi
+    fi
     # Clean up shell completions
     if [[ -f /usr/share/fish/vendor_completions.d/looking-glass-setup.fish ]]; then
         rm -f /usr/share/fish/vendor_completions.d/looking-glass-setup.fish
@@ -230,6 +244,25 @@ Icon=video-display
 Categories=System;Emulator;
 DESKTOP
     log "SUCCESS" "Desktop entry created at $desktop_file"
+
+    # Also place a shortcut on the user's Desktop
+    local target_user target_home desktop_dir
+    target_user="${REAL_USER:-${SUDO_USER:-}}"
+    if [[ -z "$target_user" || "$target_user" == "root" ]]; then
+        target_user="${USER:-}"
+    fi
+    if [[ -n "$target_user" && "$target_user" != "root" ]]; then
+        target_home="$(getent passwd "$target_user" | cut -d: -f6)"
+        desktop_dir="$target_home/Desktop"
+        if [[ -d "$desktop_dir" ]]; then
+            cp -f "$desktop_file" "$desktop_dir/looking-glass-client.desktop"
+            chown "$target_user:" "$desktop_dir/looking-glass-client.desktop" 2>/dev/null || true
+            chmod +x "$desktop_dir/looking-glass-client.desktop" 2>/dev/null || true
+            log "SUCCESS" "Desktop shortcut created at $desktop_dir/looking-glass-client.desktop"
+        else
+            log "WARN" "Desktop directory not found for user $target_user; skipping desktop shortcut."
+        fi
+    fi
 }
 
 install_shell_completions() {
@@ -1037,6 +1070,20 @@ do_uninstall() {
         run_or_simulate rm -f /usr/local/share/applications/looking-glass-client.desktop
         log "SUCCESS" "Removed desktop shortcut."
     fi
+    # Remove user Desktop copy
+    local target_user target_home desktop_dir
+    target_user="${REAL_USER:-${SUDO_USER:-}}"
+    if [[ -z "$target_user" || "$target_user" == "root" ]]; then
+        target_user="${USER:-}"
+    fi
+    if [[ -n "$target_user" && "$target_user" != "root" ]]; then
+        target_home="$(getent passwd "$target_user" | cut -d: -f6)"
+        desktop_dir="$target_home/Desktop"
+        if [[ -f "$desktop_dir/looking-glass-client.desktop" ]]; then
+            run_or_simulate rm -f "$desktop_dir/looking-glass-client.desktop"
+            log "SUCCESS" "Removed desktop shortcut from $desktop_dir."
+        fi
+    fi
 
     if [[ -n "${REAL_USER:-}" && "$REAL_USER" != "root" ]]; then
         local USER_HOME
@@ -1150,6 +1197,13 @@ EOF
 
 # --- Main -------------------------------------------------------------------
 parse_args "$@"
+
+# Auto-elevate with sudo if not running as root
+if [[ $EUID -ne 0 ]]; then
+    log "INFO" "Not running as root. Re-launching with sudo…"
+    exec sudo "${BASH_SOURCE[0]}" "$@"
+fi
+
 detect_tui_backend
 log "INFO" "Starting Looking Glass Manager (mode: ${MODE})…"
 
