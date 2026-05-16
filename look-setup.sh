@@ -18,6 +18,7 @@ MODE="install"
 LOG_FILE="/var/log/looking-glass-setup.log"
 NO_TUI=false
 TUI_BACKEND="none"
+VM_NAME=""
 
 # --- Colors -----------------------------------------------------------------
 C_RED='\033[0;31m'
@@ -288,6 +289,7 @@ complete -c looking-glass-setup -l install-completions -d "Install shell complet
 complete -c looking-glass-setup -l dry-run -d "Show what would be done"
 complete -c looking-glass-setup -l no-tui -d "Disable TUI prompts"
 complete -c looking-glass-setup -l yes -s y -d "Skip confirmations"
+complete -c looking-glass-setup -l vm-name -d "Target VM by name (e.g. --vm-name GAMING)"
 complete -c looking-glass-setup -l help -s h -d "Show help"
 FISH
             log "SUCCESS" "Fish completions installed to $fish_dir"
@@ -308,7 +310,7 @@ FISH
             cat > "$bash_dir/looking-glass-setup" <<'BASH'
 _looking_glass_setup_completions() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
-    local opts="--install-script --self-remove --create-shortcut --uninstall --eject --install-completions --dry-run --no-tui --yes -y --help -h"
+    local opts="--install-script --self-remove --create-shortcut --uninstall --eject --install-completions --dry-run --no-tui --yes -y --vm-name --help -h"
     COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
 }
 complete -F _looking_glass_setup_completions looking-glass-setup
@@ -864,11 +866,25 @@ configure_libvirt_vm() {
 
     local selected_vm=""
 
-    # Auto-select first VM when --yes is used
-    if [[ "$YES" == true && ${#vm_list[@]} -gt 0 ]]; then
-        selected_vm="${vm_list[0]}"
-        log "INFO" "Auto-selecting VM '$selected_vm' (--yes mode)."
-    else
+    # Only --vm-name bypasses the interactive menu; otherwise force user to choose
+    if [[ -n "$VM_NAME" ]]; then
+        local vm_found=false
+        for vm in "${vm_list[@]}"; do
+            if [[ "$vm" == "$VM_NAME" ]]; then
+                vm_found=true
+                break
+            fi
+        done
+        if [[ "$vm_found" == true ]]; then
+            selected_vm="$VM_NAME"
+            log "INFO" "Using explicitly specified VM '$selected_vm' (--vm-name)."
+        else
+            log "WARN" "VM '$VM_NAME' not found. Falling back to selection."
+        fi
+    fi
+
+    # Always show interactive selection unless --vm-name was valid
+    if [[ -z "$selected_vm" ]]; then
         local menu_items=()
         local vm i=1
         for vm in "${vm_list[@]}"; do
@@ -1022,7 +1038,37 @@ do_install() {
     install_shell_completions
     create_desktop_entry
 
+    # Final install verification summary
     log "SUCCESS" "Installation complete! You can now run 'looking-glass-client'."
+    log "INFO" ""
+    log "INFO" "────────── Verify These Items ──────────"
+    if [[ -x /usr/local/bin/looking-glass-client ]]; then
+        log "INFO" "  looking-glass-client: /usr/local/bin/looking-glass-client"
+    fi
+    if [[ -f /etc/tmpfiles.d/10-looking-glass.conf ]]; then
+        log "INFO" "  Shared-memory config: /etc/tmpfiles.d/10-looking-glass.conf"
+    fi
+    if [[ -e /dev/shm/looking-glass ]]; then
+        log "INFO" "  Shared-memory node:   /dev/shm/looking-glass"
+    fi
+    if [[ -f /usr/local/share/applications/looking-glass-client.desktop ]]; then
+        log "INFO" "  Desktop shortcut:       /usr/local/share/applications/looking-glass-client.desktop"
+    fi
+    if [[ -n "${REAL_USER:-}" && "$REAL_USER" != "root" ]]; then
+        local _uh
+        _uh="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+        if [[ -f "$_uh/Desktop/looking-glass-client.desktop" ]]; then
+            log "INFO" "  User Desktop shortcut: $_uh/Desktop/looking-glass-client.desktop"
+        fi
+        if [[ -f "$_uh/.looking-glass-client.ini" ]]; then
+            log "INFO" "  User config file:       $_uh/.looking-glass-client.ini"
+        fi
+    fi
+    log "INFO" "  Command to run:         looking-glass-client"
+    if [[ -n "${selected_vm:-}" ]]; then
+        log "INFO" "  Target VM:              $selected_vm"
+    fi
+    log "INFO" "────────────────────────────────────────"
 }
 
 do_uninstall() {
@@ -1198,6 +1244,10 @@ parse_args() {
                 YES=true
                 shift
                 ;;
+            --vm-name)
+                VM_NAME="$2"
+                shift 2
+                ;;
             --help|-h)
                 cat <<EOF
 Usage: sudo ./${SCRIPT_NAME} [OPTIONS]
@@ -1211,6 +1261,7 @@ Options:
   --dry-run              Show what would be done without touching the system.
   --no-tui               Disable TUI (whiptail/dialog) and use plain text prompts.
   --yes, -y              Skip confirmation prompts (use with caution!).
+  --vm-name <name>       Explicitly target a VM by name (bypasses auto-select).
   --help, -h             Show this help text.
 EOF
                 exit 0
