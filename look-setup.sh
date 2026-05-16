@@ -836,44 +836,62 @@ generate_user_config() {
 
 configure_libvirt_vm() {
     local vm_list selected_vm
+    local virsh_cmd="virsh"
+
     if ! command -v virsh >/dev/null 2>&1; then
         log "INFO" "virsh not found. Skipping libvirt VM configuration."
         return 0
     fi
-    if ! virsh list --all >/dev/null 2>&1; then
+
+    # Detect correct libvirt URI (system vs session)
+    if virsh -c qemu:///system list --all >/dev/null 2>&1; then
+        virsh_cmd="virsh -c qemu:///system"
+        log "INFO" "Using libvirt system connection (qemu:///system)."
+    elif virsh -c qemu:///session list --all >/dev/null 2>&1; then
+        virsh_cmd="virsh -c qemu:///session"
+        log "INFO" "Using libvirt session connection (qemu:///session)."
+    else
         log "WARN" "Cannot connect to libvirt. Skipping VM configuration."
         return 0
     fi
 
     log "INFO" "Scanning libvirt virtual machines…"
-    mapfile -t vm_list < <(virsh list --all --name | grep -v '^$' || true)
+    mapfile -t vm_list < <($virsh_cmd list --all --name | grep -v '^$' || true)
     if [[ ${#vm_list[@]} -eq 0 ]]; then
         log "WARN" "No libvirt VMs found. Skipping VM configuration."
         return 0
     fi
 
-    local menu_items=()
-    local vm i=1
-    for vm in "${vm_list[@]}"; do
-        local state
-        state="$(virsh domstate "$vm" 2>/dev/null || echo "unknown")"
-        menu_items+=("$i" "$vm ($state)")
-        i=$((i+1))
-    done
-    menu_items+=("0" "Skip VM configuration")
+    local selected_vm=""
 
-    local selected_idx
-    selected_idx="$(tui_menu "Select VM" "Which VM should have the Looking Glass shared memory device attached?" "${menu_items[@]}")"
-    if [[ -z "$selected_idx" || "$selected_idx" == "0" ]]; then
-        log "INFO" "Skipping VM XML automation."
-        return 0
+    # Auto-select first VM when --yes is used
+    if [[ "$YES" == true && ${#vm_list[@]} -gt 0 ]]; then
+        selected_vm="${vm_list[0]}"
+        log "INFO" "Auto-selecting VM '$selected_vm' (--yes mode)."
+    else
+        local menu_items=()
+        local vm i=1
+        for vm in "${vm_list[@]}"; do
+            local state
+        state="$($virsh_cmd domstate "$vm" 2>/dev/null || echo "unknown")"
+            menu_items+=("$i" "$vm ($state)")
+            i=$((i+1))
+        done
+        menu_items+=("0" "Skip VM configuration")
+
+        local selected_idx
+        selected_idx="$(tui_menu "Select VM" "Which VM should have the Looking Glass shared memory device attached?" "${menu_items[@]}")"
+        if [[ -z "$selected_idx" || "$selected_idx" == "0" ]]; then
+            log "INFO" "Skipping VM XML automation."
+            return 0
+        fi
+        selected_vm="${vm_list[$((selected_idx-1))]}"
     fi
-    selected_vm="${vm_list[$((selected_idx-1))]}"
 
     log "INFO" "Targeting VM: $selected_vm"
 
     log "INFO" "Checking VM '$selected_vm' for existing shmem device…"
-    if virsh dumpxml "$selected_vm" 2>/dev/null | grep -q "model type='ivshmem-plain'"; then
+    if $virsh_cmd dumpxml "$selected_vm" 2>/dev/null | grep -q "model type='ivshmem-plain'"; then
         log "SUCCESS" "VM '$selected_vm' already has an ivshmem-plain device attached."
         return 0
     fi
@@ -895,9 +913,13 @@ configure_libvirt_vm() {
 XMLEOF
 
     log "INFO" "Attaching Looking Glass shmem device to VM '$selected_vm'…"
-    if virsh attach-device --config "$selected_vm" "$tmp_xml" >/dev/null 2>&1; then
+    if $virsh_cmd attach-device --config "$selected_vm" "$tmp_xml"; then
         log "SUCCESS" "Successfully injected <shmem> hardware into VM '$selected_vm'."
         log "WARN" "IMPORTANT: If '$selected_vm' is currently running, you MUST fully shut it down (not just restart) for the new hardware to appear."
+        # Verify the device is in the persistent XML
+        if ! $virsh_cmd dumpxml --inactive "$selected_vm" 2>/dev/null | grep -q "model type='ivshmem-plain'"; then
+            log "WARN" "Device attachment reported success but ivshmem device is not present in VM persistent XML."
+        fi
     else
         log "WARN" "Failed to attach shmem device to VM '$selected_vm'. You may need to add it manually."
     fi
@@ -1114,12 +1136,18 @@ do_uninstall() {
     if command -v virsh >/dev/null 2>&1; then
         local orphan_vms=()
         local vm_name
+        local virsh_uninstall="virsh"
+        if virsh -c qemu:///system list --all >/dev/null 2>&1; then
+            virsh_uninstall="virsh -c qemu:///system"
+        elif virsh -c qemu:///session list --all >/dev/null 2>&1; then
+            virsh_uninstall="virsh -c qemu:///session"
+        fi
         while IFS= read -r vm_name; do
             [[ -z "$vm_name" ]] && continue
-            if virsh dumpxml "$vm_name" 2>/dev/null | grep -q "model type='ivshmem-plain'"; then
+            if $virsh_uninstall dumpxml "$vm_name" 2>/dev/null | grep -q "model type='ivshmem-plain'"; then
                 orphan_vms+=("$vm_name")
             fi
-        done < <(virsh list --all --name 2>/dev/null || true)
+        done < <($virsh_uninstall list --all --name 2>/dev/null || true)
 
         if [[ ${#orphan_vms[@]} -gt 0 ]]; then
             log "ERROR" "CRITICAL: The following VMs still have the Looking Glass memory device attached:"
