@@ -19,7 +19,7 @@ LOG_FILE="/var/log/looking-glass-setup.log"
 NO_TUI=false
 TUI_BACKEND="none"
 VM_NAME=""
-LG_SHMEM_SIZE="64"
+LG_SHMEM_SIZE=""
 
 # --- Colors -----------------------------------------------------------------
 C_RED='\033[0;31m'
@@ -334,7 +334,7 @@ show_main_menu() {
     menu_items+=("shortcut" "Create Desktop Shortcut")
     menu_items+=("deploy" "Install Script to PATH")
     menu_items+=("exit" "Exit")
-    choice="$(tui_menu "Looking Glass Manager" "Select an action:" "${menu_items[@]}")"
+    choice="$(tui_menu "Looking Glass Manager" "Select an action:" "" "${menu_items[@]}")"
     case "$choice" in
         install)
             MODE="install"
@@ -375,7 +375,7 @@ maybe_prompt_install() {
     fi
 
     local choice
-    choice="$(tui_menu "Deploy Script" "How would you like to run this script?" \
+    choice="$(tui_menu "Deploy Script" "How would you like to run this script?" "" \
         "install" "Install to $INSTALLED_PATH" \
         "source"  "Run from source (do not install)")"
     case "$choice" in
@@ -447,14 +447,23 @@ tui_yesno() {
 tui_menu() {
     local title="$1"
     local text="$2"
-    shift 2
+    local default_item="${3:-}"
+    shift 3
     local result=""
     case "$TUI_BACKEND" in
         whiptail)
-            result=$(whiptail --title "$title" --menu "$text" 20 70 10 "$@" 3>&1 1>&2 2>&3) || true
+            if [[ -n "$default_item" ]]; then
+                result=$(whiptail --title "$title" --default-item "$default_item" --menu "$text" 20 70 10 "$@" 3>&1 1>&2 2>&3) || true
+            else
+                result=$(whiptail --title "$title" --menu "$text" 20 70 10 "$@" 3>&1 1>&2 2>&3) || true
+            fi
             ;;
         dialog)
-            result=$(dialog --title "$title" --menu "$text" 20 70 10 "$@" 3>&1 1>&2 2>&3) || true
+            if [[ -n "$default_item" ]]; then
+                result=$(dialog --title "$title" --default-item "$default_item" --menu "$text" 20 70 10 "$@" 3>&1 1>&2 2>&3) || true
+            else
+                result=$(dialog --title "$title" --menu "$text" 20 70 10 "$@" 3>&1 1>&2 2>&3) || true
+            fi
             ;;
         *)
             printf "\n" >&2
@@ -465,7 +474,11 @@ tui_menu() {
             while [[ $# -gt 0 ]]; do
                 tags+=("$1")
                 items+=("$2")
-                printf "  ${C_YELLOW}%d)${C_NC} %s\n" "$i" "$2" >&2
+                local marker="  "
+                if [[ "$1" == "$default_item" ]]; then
+                    marker="=>"
+                fi
+                printf "  ${C_YELLOW}%d) %s${C_NC} %s\n" "$i" "$marker" "$2" >&2
                 shift 2
                 i=$((i+1))
             done
@@ -838,6 +851,123 @@ generate_user_config() {
     fi
 }
 
+get_vm_shmem_size() {
+    local vm_name="$1"
+    local virsh_cmd="$2"
+    local size
+    size="$($virsh_cmd dumpxml --inactive "$vm_name" 2>/dev/null | grep -oP "(?<=<size unit='M'>)[^<]+" || true)"
+    printf '%s' "$size"
+}
+
+remove_shmem_from_vm() {
+    local vm_name="$1"
+    local virsh_cmd="$2"
+    local dry="${3:-false}"
+
+    if [[ "$dry" == true ]]; then
+        log "INFO" "[DRY-RUN] Would remove ivshmem device from VM '$vm_name'."
+        return 0
+    fi
+
+    local tmp_xml
+    tmp_xml="$(mktemp)"
+    _TRAPPED_TMP_XML="$tmp_xml"
+    _trapped_cleanup() {
+        [[ -n "${_TRAPPED_TMP_XML:-}" ]] && rm -f "$_TRAPPED_TMP_XML" >/dev/null 2>&1 || true
+        _TRAPPED_TMP_XML=""
+        trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+    }
+    trap '_trapped_cleanup' INT TERM
+    cat > "$tmp_xml" <<'XMLEOF'
+<shmem name='looking-glass'>
+  <model type='ivshmem-plain'/>
+</shmem>
+XMLEOF
+    log "INFO" "Removing ivshmem device from VM '$vm_name'…"
+    if $virsh_cmd detach-device --config "$vm_name" "$tmp_xml"; then
+        log "SUCCESS" "Removed ivshmem device from VM '$vm_name'."
+    else
+        log "WARN" "Failed to detach ivshmem device from VM '$vm_name'."
+    fi
+    rm -f "$tmp_xml"
+    _TRAPPED_TMP_XML=""
+    trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+}
+
+attach_shmem_to_vm() {
+    local vm_name="$1"
+    local virsh_cmd="$2"
+    local size="$3"
+    local dry="${4:-false}"
+
+    if [[ "$dry" == true ]]; then
+        log "INFO" "[DRY-RUN] Would attach ${size}MB shmem device to VM '$vm_name'."
+        return 0
+    fi
+
+    local tmp_xml
+    tmp_xml="$(mktemp)"
+    _TRAPPED_TMP_XML="$tmp_xml"
+    _trapped_cleanup() {
+        [[ -n "${_TRAPPED_TMP_XML:-}" ]] && rm -f "$_TRAPPED_TMP_XML" >/dev/null 2>&1 || true
+        _TRAPPED_TMP_XML=""
+        trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+    }
+    trap '_trapped_cleanup' INT TERM
+    cat > "$tmp_xml" <<XMLEOF
+<shmem name='looking-glass'>
+  <model type='ivshmem-plain'/>
+  <size unit='M'>${size}</size>
+</shmem>
+XMLEOF
+
+    log "INFO" "Attaching ${size}MB Looking Glass shmem device to VM '$vm_name'…"
+    if $virsh_cmd attach-device --config "$vm_name" "$tmp_xml"; then
+        log "SUCCESS" "Successfully injected <shmem> hardware into VM '$vm_name'."
+        log "WARN" "IMPORTANT: If '$vm_name' is currently running, you MUST fully shut it down (not just restart) for the new hardware to appear."
+        if ! $virsh_cmd dumpxml --inactive "$vm_name" 2>/dev/null | grep -q "model type='ivshmem-plain'"; then
+            log "WARN" "Device attachment reported success but ivshmem device is not present in VM persistent XML."
+        fi
+    else
+        log "WARN" "Failed to attach shmem device to VM '$vm_name'. You may need to add it manually."
+    fi
+    rm -f "$tmp_xml"
+    _TRAPPED_TMP_XML=""
+    trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+}
+
+shmem_size_menu() {
+    local current_size="${1:-}"
+    local prompt="${2:-Select the shared-memory pool size for your target resolution:}"
+    local default_item="64"
+    local result=""
+
+    # Map size to default menu tag
+    if [[ "$current_size" == "128" ]]; then
+        default_item="128"
+    elif [[ "$current_size" == "256" ]]; then
+        default_item="256"
+    elif [[ "$current_size" == "512" ]]; then
+        default_item="512"
+    fi
+
+    if [[ -n "$current_size" && "$current_size" != "" ]]; then
+        prompt="Current size: ${current_size}MB. ${prompt}"
+    fi
+
+    local -a menu_args=(
+        "Shared Memory Size"
+        "$prompt"
+        "$default_item"
+        "64" "64 MB  — Full HD / 1080p"
+        "128" "128 MB — 1440p / QHD"
+        "256" "256 MB — 4K / UHD"
+        "512" "512 MB — Ultrawide 4K / High Refresh"
+    )
+    result="$(tui_menu "${menu_args[@]}")"
+    printf '%s' "$result"
+}
+
 configure_libvirt_vm() {
     local vm_list selected_vm
     local virsh_cmd="virsh"
@@ -890,15 +1020,22 @@ configure_libvirt_vm() {
         local menu_items=()
         local vm i=1
         for vm in "${vm_list[@]}"; do
-            local state
-        state="$($virsh_cmd domstate "$vm" 2>/dev/null || echo "unknown")"
-            menu_items+=("$i" "$vm ($state)")
+            local state shmem_info
+            state="$($virsh_cmd domstate "$vm" 2>/dev/null || echo "unknown")"
+            if $virsh_cmd dumpxml --inactive "$vm" 2>/dev/null | grep -q "model type='ivshmem-plain'"; then
+                local cur_size
+                cur_size="$(get_vm_shmem_size "$vm" "$virsh_cmd")"
+                shmem_info=" [ivshmem ${cur_size}MB]"
+            else
+                shmem_info=""
+            fi
+            menu_items+=("$i" "$vm ($state)${shmem_info}")
             i=$((i+1))
         done
         menu_items+=("0" "Skip VM configuration")
 
         local selected_idx
-        selected_idx="$(tui_menu "Select VM" "Which VM should have the Looking Glass shared memory device attached?" "${menu_items[@]}")"
+        selected_idx="$(tui_menu "Select VM" "Which VM should have the Looking Glass shared memory device attached?" "" "${menu_items[@]}")"
         if [[ -z "$selected_idx" || "$selected_idx" == "0" ]]; then
             log "INFO" "Skipping VM XML automation."
             return 0
@@ -908,57 +1045,86 @@ configure_libvirt_vm() {
 
     log "INFO" "Targeting VM: $selected_vm"
 
-    log "INFO" "Checking VM '$selected_vm' for existing shmem device…"
-    if $virsh_cmd dumpxml "$selected_vm" 2>/dev/null | grep -q "model type='ivshmem-plain'"; then
-        log "SUCCESS" "VM '$selected_vm' already has an ivshmem-plain device attached."
-        return 0
+    # Detect existing shmem configuration on this VM
+    local has_shmem=false
+    local current_size=""
+    if $virsh_cmd dumpxml --inactive "$selected_vm" 2>/dev/null | grep -q "model type='ivshmem-plain'"; then
+        has_shmem=true
+        current_size="$(get_vm_shmem_size "$selected_vm" "$virsh_cmd")"
+        log "INFO" "Detected existing ivshmem device on '$selected_vm' with size: ${current_size}MB."
     fi
 
-    # Prompt for shared-memory size unless already set via --shmem-size
-    if [[ -z "$LG_SHMEM_SIZE" || "$LG_SHMEM_SIZE" == "64" ]] && [[ "$YES" != true && "$DRY_RUN" != true ]]; then
-        local size_idx
-        size_idx="$(tui_menu "Shared Memory Size" "Select the shared-memory pool size for your target resolution:" \
-            "64" "64 MB  — Full HD / 1080p (default)" \
-            "128" "128 MB — 1440p / QHD" \
-            "256" "256 MB — 4K / UHD" \
-            "512" "512 MB — Ultrawide 4K / High Refresh")"
-        if [[ -n "$size_idx" ]]; then
-            LG_SHMEM_SIZE="$size_idx"
-        else
-            LG_SHMEM_SIZE="64"
+    # Determine what size to use
+    local target_size=""
+
+    if [[ -n "$LG_SHMEM_SIZE" && "$LG_SHMEM_SIZE" != "" ]]; then
+        # User explicitly passed --shmem-size: use it directly
+        target_size="$LG_SHMEM_SIZE"
+        if [[ "$has_shmem" == true && "$target_size" != "$current_size" ]]; then
+            log "INFO" "Replacing existing ${current_size}MB ivshmem with ${target_size}MB (--shmem-size)."
+            remove_shmem_from_vm "$selected_vm" "$virsh_cmd" "$DRY_RUN"
+        elif [[ "$has_shmem" == true && "$target_size" == "$current_size" ]]; then
+            log "SUCCESS" "VM '$selected_vm' already has ${target_size}MB ivshmem-plain device attached."
+            return 0
         fi
-        log "INFO" "Selected shared-memory size: ${LG_SHMEM_SIZE}MB"
+    elif [[ "$has_shmem" == true && "$YES" != true && "$DRY_RUN" != true ]]; then
+        # Interactive: VM already has shmem — ask user what to do
+        local action
+        action="$(tui_menu "VM Configuration" "VM '$selected_vm' already has a ${current_size}MB ivshmem device. What do you want to do?" "" \
+            "keep" "Keep current settings (${current_size}MB)" \
+            "change" "Change shared-memory size" \
+            "remove" "Remove ivshmem device")"
+        case "$action" in
+            keep|"")
+                log "SUCCESS" "Kept existing ivshmem device on '$selected_vm' (${current_size}MB)."
+                LG_SHMEM_SIZE="$current_size"
+                return 0
+                ;;
+            change)
+                target_size="$(shmem_size_menu "$current_size")"
+                if [[ -z "$target_size" ]]; then
+                    target_size="$current_size"
+                fi
+                if [[ "$target_size" != "$current_size" ]]; then
+                    remove_shmem_from_vm "$selected_vm" "$virsh_cmd" "$DRY_RUN"
+                else
+                    log "SUCCESS" "Size unchanged (${current_size}MB)."
+                    LG_SHMEM_SIZE="$current_size"
+                    return 0
+                fi
+                ;;
+            remove)
+                remove_shmem_from_vm "$selected_vm" "$virsh_cmd" "$DRY_RUN"
+                LG_SHMEM_SIZE=""
+                return 0
+                ;;
+        esac
+    elif [[ "$has_shmem" == false ]]; then
+        # No shmem yet — prompt for size unless --shmem-size was given
+        if [[ -n "$LG_SHMEM_SIZE" && "$LG_SHMEM_SIZE" != "" ]]; then
+            target_size="$LG_SHMEM_SIZE"
+        elif [[ "$YES" != true && "$DRY_RUN" != true ]]; then
+            target_size="$(shmem_size_menu "")"
+            if [[ -z "$target_size" ]]; then
+                target_size="64"
+            fi
+        else
+            target_size="64"
+        fi
     fi
+
+    LG_SHMEM_SIZE="$target_size"
 
     if [[ "$DRY_RUN" == true ]]; then
-        log "INFO" "[DRY-RUN] Would attach ${LG_SHMEM_SIZE}MB shmem device to VM '$selected_vm'."
+        if [[ "$has_shmem" == true ]]; then
+            log "INFO" "[DRY-RUN] Would replace ${current_size}MB with ${target_size}MB on VM '$selected_vm'."
+        else
+            log "INFO" "[DRY-RUN] Would attach ${target_size}MB shmem device to VM '$selected_vm'."
+        fi
         return 0
     fi
 
-    local tmp_xml
-    tmp_xml="$(mktemp)"
-    # shellcheck disable=SC2064
-    trap "rm -f '$tmp_xml' >/dev/null 2>&1 || true; trap 'log \"WARN\" \"Interrupted by user.\"; exit 130' INT TERM" INT TERM
-    cat > "$tmp_xml" <<XMLEOF
-<shmem name='looking-glass'>
-  <model type='ivshmem-plain'/>
-  <size unit='M'>${LG_SHMEM_SIZE}</size>
-</shmem>
-XMLEOF
-
-    log "INFO" "Attaching Looking Glass shmem device to VM '$selected_vm'…"
-    if $virsh_cmd attach-device --config "$selected_vm" "$tmp_xml"; then
-        log "SUCCESS" "Successfully injected <shmem> hardware into VM '$selected_vm'."
-        log "WARN" "IMPORTANT: If '$selected_vm' is currently running, you MUST fully shut it down (not just restart) for the new hardware to appear."
-        # Verify the device is in the persistent XML
-        if ! $virsh_cmd dumpxml --inactive "$selected_vm" 2>/dev/null | grep -q "model type='ivshmem-plain'"; then
-            log "WARN" "Device attachment reported success but ivshmem device is not present in VM persistent XML."
-        fi
-    else
-        log "WARN" "Failed to attach shmem device to VM '$selected_vm'. You may need to add it manually."
-    fi
-    rm -f "$tmp_xml"
-    trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+    attach_shmem_to_vm "$selected_vm" "$virsh_cmd" "$target_size" "$DRY_RUN"
 }
 
 do_install() {
