@@ -19,6 +19,7 @@ LOG_FILE="/var/log/looking-glass-setup.log"
 NO_TUI=false
 TUI_BACKEND="none"
 VM_NAME=""
+LG_SHMEM_SIZE="64"
 
 # --- Colors -----------------------------------------------------------------
 C_RED='\033[0;31m'
@@ -290,6 +291,7 @@ complete -c looking-glass-setup -l dry-run -d "Show what would be done"
 complete -c looking-glass-setup -l no-tui -d "Disable TUI prompts"
 complete -c looking-glass-setup -l yes -s y -d "Skip confirmations"
 complete -c looking-glass-setup -l vm-name -d "Target VM by name (e.g. --vm-name GAMING)"
+complete -c looking-glass-setup -l shmem-size -d "Pool size in MB: 64/128/256/512"
 complete -c looking-glass-setup -l help -s h -d "Show help"
 FISH
             log "SUCCESS" "Fish completions installed to $fish_dir"
@@ -310,7 +312,7 @@ FISH
             cat > "$bash_dir/looking-glass-setup" <<'BASH'
 _looking_glass_setup_completions() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
-    local opts="--install-script --self-remove --create-shortcut --uninstall --eject --install-completions --dry-run --no-tui --yes -y --vm-name --help -h"
+    local opts="--install-script --self-remove --create-shortcut --uninstall --eject --install-completions --dry-run --no-tui --yes -y --vm-name --shmem-size --help -h"
     COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
 }
 complete -F _looking_glass_setup_completions looking-glass-setup
@@ -912,8 +914,24 @@ configure_libvirt_vm() {
         return 0
     fi
 
+    # Prompt for shared-memory size unless already set via --shmem-size
+    if [[ -z "$LG_SHMEM_SIZE" || "$LG_SHMEM_SIZE" == "64" ]] && [[ "$YES" != true && "$DRY_RUN" != true ]]; then
+        local size_idx
+        size_idx="$(tui_menu "Shared Memory Size" "Select the shared-memory pool size for your target resolution:" \
+            "64" "64 MB  — Full HD / 1080p (default)" \
+            "128" "128 MB — 1440p / QHD" \
+            "256" "256 MB — 4K / UHD" \
+            "512" "512 MB — Ultrawide 4K / High Refresh")"
+        if [[ -n "$size_idx" ]]; then
+            LG_SHMEM_SIZE="$size_idx"
+        else
+            LG_SHMEM_SIZE="64"
+        fi
+        log "INFO" "Selected shared-memory size: ${LG_SHMEM_SIZE}MB"
+    fi
+
     if [[ "$DRY_RUN" == true ]]; then
-        log "INFO" "[DRY-RUN] Would attach shmem device to VM '$selected_vm'."
+        log "INFO" "[DRY-RUN] Would attach ${LG_SHMEM_SIZE}MB shmem device to VM '$selected_vm'."
         return 0
     fi
 
@@ -921,10 +939,10 @@ configure_libvirt_vm() {
     tmp_xml="$(mktemp)"
     # shellcheck disable=SC2064
     trap "rm -f '$tmp_xml' >/dev/null 2>&1 || true; trap 'log \"WARN\" \"Interrupted by user.\"; exit 130' INT TERM" INT TERM
-    cat > "$tmp_xml" <<'XMLEOF'
+    cat > "$tmp_xml" <<XMLEOF
 <shmem name='looking-glass'>
   <model type='ivshmem-plain'/>
-  <size unit='M'>64</size>
+  <size unit='M'>${LG_SHMEM_SIZE}</size>
 </shmem>
 XMLEOF
 
@@ -1068,6 +1086,7 @@ do_install() {
     if [[ -n "${selected_vm:-}" ]]; then
         log "INFO" "  Target VM:              $selected_vm"
     fi
+    log "INFO" "  Shared-memory size:     ${LG_SHMEM_SIZE}MB"
     log "INFO" "────────────────────────────────────────"
 }
 
@@ -1248,6 +1267,10 @@ parse_args() {
                 VM_NAME="$2"
                 shift 2
                 ;;
+            --shmem-size)
+                LG_SHMEM_SIZE="$2"
+                shift 2
+                ;;
             --help|-h)
                 cat <<EOF
 Usage: sudo ./${SCRIPT_NAME} [OPTIONS]
@@ -1262,6 +1285,7 @@ Options:
   --no-tui               Disable TUI (whiptail/dialog) and use plain text prompts.
   --yes, -y              Skip confirmation prompts (use with caution!).
   --vm-name <name>       Explicitly target a VM by name (bypasses auto-select).
+  --shmem-size <MB>      Shared-memory pool size (default: 64). Common: 64 (1080p), 128 (1440p), 256 (4K), 512 (UW 4K).
   --help, -h             Show this help text.
 EOF
                 exit 0
