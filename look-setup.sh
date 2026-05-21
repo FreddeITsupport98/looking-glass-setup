@@ -899,7 +899,7 @@ get_vm_shmem_size() {
     local vm_name="$1"
     local virsh_cmd="$2"
     local size
-    size="$($virsh_cmd dumpxml --inactive "$vm_name" 2>/dev/null | grep -oP "(?<=<size unit='M'>)[^<]+" || true)"
+    size="$($virsh_cmd dumpxml --inactive "$vm_name" 2>/dev/null | grep -oP "(?<=<size unit='M'>)[^<]+" | head -n 1 || true)"
     printf '%s' "$size"
 }
 
@@ -907,9 +907,10 @@ remove_shmem_from_vm() {
     local vm_name="$1"
     local virsh_cmd="$2"
     local dry="${3:-false}"
+    local size="${4:-}"
 
     if [[ "$dry" == true ]]; then
-        log "INFO" "[DRY-RUN] Would remove ivshmem device from VM '$vm_name'."
+        log "INFO" "[DRY-RUN] Would remove ivshmem device(s) from VM '$vm_name'."
         return 0
     fi
 
@@ -922,17 +923,51 @@ remove_shmem_from_vm() {
         trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
     }
     trap '_trapped_cleanup' INT TERM
-    cat > "$tmp_xml" <<'XMLEOF'
+
+    local removed_count=0
+    local attempt=0
+    local max_attempts=10
+
+    while [[ "$attempt" -lt "$max_attempts" ]]; do
+        if ! $virsh_cmd dumpxml --inactive "$vm_name" 2>/dev/null | grep -q "model type='ivshmem-plain'"; then
+            break
+        fi
+
+        attempt=$((attempt + 1))
+
+        if [[ "$attempt" -eq 1 && -n "$size" ]]; then
+            cat > "$tmp_xml" <<XMLEOF
+<shmem name='looking-glass'>
+  <model type='ivshmem-plain'/>
+  <size unit='M'>${size}</size>
+</shmem>
+XMLEOF
+        else
+            cat > "$tmp_xml" <<'XMLEOF'
 <shmem name='looking-glass'>
   <model type='ivshmem-plain'/>
 </shmem>
 XMLEOF
-    log "INFO" "Removing ivshmem device from VM '$vm_name'…"
-    if $virsh_cmd detach-device --config "$vm_name" "$tmp_xml"; then
-        log "SUCCESS" "Removed ivshmem device from VM '$vm_name'."
+        fi
+
+        log "INFO" "Removing ivshmem device from VM '$vm_name' (attempt ${attempt})…"
+        if $virsh_cmd detach-device --config "$vm_name" "$tmp_xml"; then
+            removed_count=$((removed_count + 1))
+            log "SUCCESS" "Removed ivshmem device (attempt ${attempt})."
+        else
+            log "WARN" "Failed to detach ivshmem device from VM '$vm_name' (attempt ${attempt})."
+            if [[ "$attempt" -gt 1 ]]; then
+                break
+            fi
+        fi
+    done
+
+    if [[ "$removed_count" -eq 0 ]]; then
+        log "WARN" "No ivshmem devices were removed from VM '$vm_name'."
     else
-        log "WARN" "Failed to detach ivshmem device from VM '$vm_name'."
+        log "SUCCESS" "Removed ${removed_count} ivshmem device(s) from VM '$vm_name'."
     fi
+
     rm -f "$tmp_xml"
     _TRAPPED_TMP_XML=""
     trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
@@ -1096,6 +1131,11 @@ configure_libvirt_vm() {
         has_shmem=true
         current_size="$(get_vm_shmem_size "$selected_vm" "$virsh_cmd")"
         log "INFO" "Detected existing ivshmem device on '$selected_vm' with size: ${current_size}MB."
+        local ivshmem_count
+        ivshmem_count="$($virsh_cmd dumpxml --inactive "$selected_vm" 2>/dev/null | grep -c "model type='ivshmem-plain'" || echo 0)"
+        if [[ "$ivshmem_count" -gt 1 ]]; then
+            log "WARN" "Found ${ivshmem_count} ivshmem devices on '$selected_vm' (possible duplicate from a previous swap). All will be removed before attaching the new device."
+        fi
     fi
 
     # Determine what size to use
@@ -1106,7 +1146,7 @@ configure_libvirt_vm() {
         target_size="$LG_SHMEM_SIZE"
         if [[ "$has_shmem" == true && "$target_size" != "$current_size" ]]; then
             log "INFO" "Replacing existing ${current_size}MB ivshmem with ${target_size}MB (--shmem-size)."
-            remove_shmem_from_vm "$selected_vm" "$virsh_cmd" "$DRY_RUN"
+            remove_shmem_from_vm "$selected_vm" "$virsh_cmd" "$DRY_RUN" "$current_size"
         elif [[ "$has_shmem" == true && "$target_size" == "$current_size" ]]; then
             log "SUCCESS" "VM '$selected_vm' already has ${target_size}MB ivshmem-plain device attached."
             return 0
@@ -1130,7 +1170,7 @@ configure_libvirt_vm() {
                     target_size="$current_size"
                 fi
                 if [[ "$target_size" != "$current_size" ]]; then
-                    remove_shmem_from_vm "$selected_vm" "$virsh_cmd" "$DRY_RUN"
+                    remove_shmem_from_vm "$selected_vm" "$virsh_cmd" "$DRY_RUN" "$current_size"
                 else
                     log "SUCCESS" "Size unchanged (${current_size}MB)."
                     LG_SHMEM_SIZE="$current_size"
@@ -1138,7 +1178,7 @@ configure_libvirt_vm() {
                 fi
                 ;;
             remove)
-                remove_shmem_from_vm "$selected_vm" "$virsh_cmd" "$DRY_RUN"
+                remove_shmem_from_vm "$selected_vm" "$virsh_cmd" "$DRY_RUN" "$current_size"
                 LG_SHMEM_SIZE=""
                 return 0
                 ;;

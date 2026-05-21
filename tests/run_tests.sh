@@ -194,6 +194,13 @@ selected_vm="${vm_list[$((selected_idx-1))]}"
 assert_eq "$selected_vm" "Ubuntu 22.04" "index-to-VM mapping correct"
 
 echo ""
+echo "--- Test Group: get_vm_shmem_size returns first match ---"
+# Simulate the updated grep logic: head -n 1 ensures only the first <size> is returned
+xml_input="<size unit='M'>128</size>\n<shmem name='other'>\n<size unit='M'>64</size>"
+result="$(printf '%s' "$xml_input" | grep -oP "(?<=<size unit='M'>)[^<]+" | head -n 1 || true)"
+assert_eq "$result" "128" "get_vm_shmem_size returns first size match only"
+
+echo ""
 echo "========================================"
 echo "Test Results: $PASS passed, $FAIL failed"
 if [[ ${#FAILED_TESTS[@]} -gt 0 ]]; then

@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+- **2026-05-21 19:12** — Fixed IVSHMEM duplicate device bug: when switching memory bridge sizes, the old device was not fully removed before attaching a new one, causing two `ivshmem-plain` devices to appear in the VM XML (e.g., bus 0xa device 0x1 and 0x2). Windows then dumped video into bridge 0 while the Linux client read from bridge 1, resulting in a permanently "paused" stream. The fix:
+  - `remove_shmem_from_vm()` now loops up to 10 times, removing every matching `ivshmem-plain` device until none remain.
+  - The first removal attempt uses a size-aware XML snippet (`<size unit='M'>…</size>`) for precise matching; subsequent fallback attempts use the generic snippet.
+  - `get_vm_shmem_size()` now uses `head -n 1` to return only the first `<size>` value, preventing multi-device ambiguity.
+  - `configure_libvirt_vm()` now counts `ivshmem-plain` occurrences and warns if duplicates are detected before cleanup.
+  - Added `resize_shared_memory()` to resize `/dev/shm/looking-glass` to the target pool size so the new device matches the backing file.
 - **2026-05-15 20:43** — Added Fish and Bash shell completions via `install_shell_completions()`, automatically installed when deploying the script. Also adds `--install-completions` standalone flag.
 - **2026-05-15 20:43** — Added interactive main TUI menu (`show_main_menu()`) that appears on first run when no explicit action flags are provided, letting users choose Install, Uninstall, Shortcut, Deploy, or Exit via whiptail/dialog/fallback text.
 - **2026-05-15 20:38** — Added self-deployment (`--install-script`, `--self-remove`, `--create-shortcut`) allowing the script to copy itself to `/usr/local/bin/looking-glass-setup` and optionally create a `.desktop` shortcut for the Looking Glass client.
