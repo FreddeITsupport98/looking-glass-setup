@@ -719,14 +719,58 @@ compile_from_source() {
 
 setup_shared_memory() {
     local desired_line
-    log "INFO" "Configuring persistent shared memory for user: ${REAL_USER:-<unknown>}"
-    desired_line="f /dev/shm/looking-glass 0660 ${REAL_USER:-root} ${VIRT_GROUP:-root} -"
+    local qemu_user="qemu"
+    local qemu_group="qemu"
+    if ! id -u "$qemu_user" >/dev/null 2>&1; then
+        qemu_user="root"
+    fi
+    if ! getent group "$qemu_group" >/dev/null 2>&1; then
+        qemu_group="root"
+    fi
+
+    log "INFO" "Configuring persistent shared memory (owner: $qemu_user:$qemu_group, mode: 666)"
+    desired_line="f /dev/shm/looking-glass 0666 $qemu_user $qemu_group -"
     write_tmpfiles_idempotent "/etc/tmpfiles.d/10-looking-glass.conf" "$desired_line"
     if command -v systemd-tmpfiles >/dev/null 2>&1; then
         run_or_simulate systemd-tmpfiles --create /etc/tmpfiles.d/10-looking-glass.conf
     else
         log "WARN" "systemd-tmpfiles unavailable; shared-memory node will be created on next boot by systemd."
     fi
+}
+
+resize_shared_memory() {
+    local size="${1:-64}"
+    local qemu_user="qemu"
+    local qemu_group="qemu"
+    if ! id -u "$qemu_user" >/dev/null 2>&1; then
+        qemu_user="root"
+    fi
+    if ! getent group "$qemu_group" >/dev/null 2>&1; then
+        qemu_group="root"
+    fi
+
+    log "INFO" "Resizing shared-memory file to ${size}MB for VM compatibility…"
+    if [[ "$DRY_RUN" == true ]]; then
+        log "INFO" "[DRY-RUN] Would truncate /dev/shm/looking-glass to ${size}MB and set permissions."
+        return 0
+    fi
+
+    if [[ ! -e /dev/shm/looking-glass ]]; then
+        touch /dev/shm/looking-glass
+    fi
+
+    truncate -s "${size}M" /dev/shm/looking-glass
+    chown "$qemu_user:$qemu_group" /dev/shm/looking-glass
+    chmod 666 /dev/shm/looking-glass
+
+    if command -v getenforce >/dev/null 2>&1 && command -v chcon >/dev/null 2>&1; then
+        local selinux_state
+        selinux_state="$(getenforce)"
+        if [[ "$selinux_state" != "Disabled" ]]; then
+            chcon -t svirt_tmpfs_t /dev/shm/looking-glass || true
+        fi
+    fi
+    log "SUCCESS" "Shared-memory file resized to ${size}MB and permissions applied."
 }
 
 setup_security() {
@@ -1219,6 +1263,7 @@ do_install() {
     setup_security
     generate_user_config
     configure_libvirt_vm
+    resize_shared_memory "${LG_SHMEM_SIZE:-64}"
     install_shell_completions
     create_desktop_entry
 
