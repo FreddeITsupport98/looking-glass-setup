@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+- **2026-05-29 19:04** — Added ReBAR 64-bit MMIO VM configuration support.
+  - New functions `vm_has_rebar_config()`, `enable_vm_rebar()`, `disable_vm_rebar()`, `configure_vm_rebar()`, and `do_rebar_standalone()`.
+  - Adds `xmlns:qemu` namespace to `<domain>` if missing, and inserts `<qemu:commandline>` with `-fw_cfg opt/ovmf/X-PciMmio64Mb,string=65536` before `</domain>`.
+  - Disable removes the ReBAR block and cleans up `xmlns:qemu` when no other QEMU elements remain.
+  - Both enable and disable use python3 (preferred) or perl as XML transform fallback. Clean temp-file traps on INT/TERM.
+  - `configure_vm_rebar()` checks if the VM already has ReBAR — if yes, offers keep/disable; if no, offers enable/skip.
+  - Integrated into the install pipeline so ReBAR is prompted automatically after ivshmem setup.
+  - New CLI flags: `--enable-rebar` and `--disable-rebar` (standalone actions, target via `--vm-name`).
+  - New TUI menu items: "Enable ReBAR on VM" and "Disable ReBAR on VM".
+  - Updated Fish and Bash completions.
+  - Uninstaller scans for orphan `X-PciMmio64Mb` configs and warns if found.
+
 - **2026-05-21 19:12** — Fixed IVSHMEM duplicate device bug: when switching memory bridge sizes, the old device was not fully removed before attaching a new one, causing two `ivshmem-plain` devices to appear in the VM XML (e.g., bus 0xa device 0x1 and 0x2). Windows then dumped video into bridge 0 while the Linux client read from bridge 1, resulting in a permanently "paused" stream. The fix:
   - `remove_shmem_from_vm()` now loops up to 10 times, removing every matching `ivshmem-plain` device until none remain.
   - The first removal attempt uses a size-aware XML snippet (`<size unit='M'>…</size>`) for precise matching; subsequent fallback attempts use the generic snippet.

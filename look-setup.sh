@@ -174,6 +174,8 @@ install_script() {
         log "INFO" "  sudo looking-glass-setup --dry-run      # Preview changes without applying"
         log "INFO" "  sudo looking-glass-setup --yes          # Skip all confirmation prompts"
         log "INFO" "  sudo looking-glass-setup --help         # Show full help"
+        log "INFO" "  sudo looking-glass-setup --enable-rebar    # Enable ReBAR 64-bit MMIO on VM"
+        log "INFO" "  sudo looking-glass-setup --disable-rebar   # Disable ReBAR 64-bit MMIO on VM"
     else
         log "ERROR" "Failed to copy script to $INSTALLED_PATH. Are you root?"
         return 1
@@ -292,6 +294,8 @@ complete -c looking-glass-setup -l no-tui -d "Disable TUI prompts"
 complete -c looking-glass-setup -l yes -s y -d "Skip confirmations"
 complete -c looking-glass-setup -l vm-name -d "Target VM by name (e.g. --vm-name GAMING)"
 complete -c looking-glass-setup -l shmem-size -d "Pool size in MB: 64/128/256/512"
+complete -c looking-glass-setup -l enable-rebar -d "Enable ReBAR 64-bit MMIO on VM"
+complete -c looking-glass-setup -l disable-rebar -d "Disable ReBAR 64-bit MMIO on VM"
 complete -c looking-glass-setup -l help -s h -d "Show help"
 FISH
             log "SUCCESS" "Fish completions installed to $fish_dir"
@@ -312,7 +316,7 @@ FISH
             cat > "$bash_dir/looking-glass-setup" <<'BASH'
 _looking_glass_setup_completions() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
-    local opts="--install-script --self-remove --create-shortcut --uninstall --eject --install-completions --dry-run --no-tui --yes -y --vm-name --shmem-size --help -h"
+    local opts="--install-script --self-remove --create-shortcut --uninstall --eject --install-completions --dry-run --no-tui --yes -y --vm-name --shmem-size --enable-rebar --disable-rebar --help -h"
     COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
 }
 complete -F _looking_glass_setup_completions looking-glass-setup
@@ -333,6 +337,8 @@ show_main_menu() {
     menu_items+=("uninstall" "Uninstall Looking Glass")
     menu_items+=("shortcut" "Create Desktop Shortcut")
     menu_items+=("deploy" "Install Script to PATH")
+    menu_items+=("enable_rebar" "Enable ReBAR on VM")
+    menu_items+=("disable_rebar" "Disable ReBAR on VM")
     menu_items+=("exit" "Exit")
     choice="$(tui_menu "Looking Glass Manager" "Select an action:" "" "${menu_items[@]}")"
     case "$choice" in
@@ -356,6 +362,22 @@ show_main_menu() {
                 exit 1
             fi
             install_script
+            exit 0
+            ;;
+        enable_rebar)
+            if [[ $EUID -ne 0 ]]; then
+                log "ERROR" "This action must be run as root. Please use sudo."
+                exit 1
+            fi
+            do_rebar_standalone "enable"
+            exit 0
+            ;;
+        disable_rebar)
+            if [[ $EUID -ne 0 ]]; then
+                log "ERROR" "This action must be run as root. Please use sudo."
+                exit 1
+            fi
+            do_rebar_standalone "disable"
             exit 0
             ;;
         exit|"")
@@ -903,6 +925,386 @@ get_vm_shmem_size() {
     printf '%s' "$size"
 }
 
+vm_has_rebar_config() {
+    local vm_name="$1"
+    local virsh_cmd="$2"
+    local xml
+    xml="$($virsh_cmd dumpxml --inactive "$vm_name" 2>/dev/null || true)"
+    if [[ "$xml" == *"xmlns:qemu="* && "$xml" == *"<qemu:commandline>"* && "$xml" == *"opt/ovmf/X-PciMmio64Mb"* ]]; then
+        return 0
+    fi
+    return 1
+}
+
+enable_vm_rebar() {
+    local vm_name="$1"
+    local virsh_cmd="$2"
+    local dry="${3:-false}"
+
+    if [[ "$dry" == true ]]; then
+        log "INFO" "[DRY-RUN] Would enable ReBAR 64-bit MMIO on VM '$vm_name'."
+        return 0
+    fi
+
+    log "INFO" "Enabling ReBAR 64-bit MMIO (64GB aperture) on VM '$vm_name'…"
+
+    local tmp_xml orig_xml
+    tmp_xml="$(mktemp)"
+    orig_xml="$(mktemp)"
+    local _TRAPPED_REBAR_TMP="$tmp_xml $orig_xml"
+    _rebar_cleanup_trap() {
+        for f in ${_TRAPPED_REBAR_TMP:-}; do
+            rm -f "$f" >/dev/null 2>&1 || true
+        done
+        _TRAPPED_REBAR_TMP=""
+        trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+    }
+    trap '_rebar_cleanup_trap' INT TERM
+
+    if ! $virsh_cmd dumpxml --inactive "$vm_name" > "$orig_xml" 2>/dev/null; then
+        log "ERROR" "Failed to dump XML for VM '$vm_name'."
+        rm -f "$tmp_xml" "$orig_xml"
+        _TRAPPED_REBAR_TMP=""
+        trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+        return 1
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$orig_xml" "$tmp_xml" <<'PYEOF'
+import sys, re
+infile, outfile = sys.argv[1], sys.argv[2]
+with open(infile, 'r') as f:
+    content = f.read()
+
+# Add namespace to <domain> if missing
+if 'xmlns:qemu=' not in content:
+    content = re.sub(r'(<domain\s+[^>]*)>', r'\1 xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">', content, count=1)
+
+# Add qemu:commandline before </domain> if missing
+if 'opt/ovmf/X-PciMmio64Mb' not in content:
+    rebar_block = '''  <qemu:commandline>
+    <qemu:arg value='-fw_cfg'/>
+    <qemu:arg value='opt/ovmf/X-PciMmio64Mb,string=65536'/>
+  </qemu:commandline>
+'''
+    content = content.replace('</domain>', rebar_block + '</domain>', 1)
+
+with open(outfile, 'w') as f:
+    f.write(content)
+PYEOF
+    elif command -v perl >/dev/null 2>&1; then
+        perl -0777 -pe "
+            s/(<domain\\s+[^>]*)>/\\1 xmlns:qemu=\\\"http:\\/\\/libvirt.org\\/schemas\\/domain\\/qemu\\/1.0\\\">/ if !/xmlns:qemu=/;
+            s/<\\/domain>/  <qemu:commandline>\\n    <qemu:arg value='-fw_cfg'\\/>\\n    <qemu:arg value='opt\\/ovmf\\/X-PciMmio64Mb,string=65536'\\/>\\n  <\\/qemu:commandline>\\n<\\/domain>/ if !/opt\\/ovmf\\/X-PciMmio64Mb/;
+        " "$orig_xml" > "$tmp_xml"
+    else
+        log "ERROR" "Neither python3 nor perl is available. Cannot modify VM XML."
+        rm -f "$tmp_xml" "$orig_xml"
+        _TRAPPED_REBAR_TMP=""
+        trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+        return 1
+    fi
+
+    if ! $virsh_cmd define "$tmp_xml" 2>/dev/null; then
+        log "ERROR" "Failed to redefine VM '$vm_name' with ReBAR configuration."
+        rm -f "$tmp_xml" "$orig_xml"
+        _TRAPPED_REBAR_TMP=""
+        trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+        return 1
+    fi
+
+    rm -f "$tmp_xml" "$orig_xml"
+    _TRAPPED_REBAR_TMP=""
+    trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+
+    log "SUCCESS" "ReBAR 64-bit MMIO (64GB aperture) enabled on VM '$vm_name'."
+    log "WARN" "IMPORTANT: Shut down (not restart) VM '$vm_name' fully for ReBAR to take effect."
+}
+
+disable_vm_rebar() {
+    local vm_name="$1"
+    local virsh_cmd="$2"
+    local dry="${3:-false}"
+
+    if [[ "$dry" == true ]]; then
+        log "INFO" "[DRY-RUN] Would disable ReBAR 64-bit MMIO on VM '$vm_name'."
+        return 0
+    fi
+
+    log "INFO" "Disabling ReBAR 64-bit MMIO on VM '$vm_name'…"
+
+    local tmp_xml orig_xml
+    tmp_xml="$(mktemp)"
+    orig_xml="$(mktemp)"
+    local _TRAPPED_REBAR_TMP="$tmp_xml $orig_xml"
+    _rebar_cleanup_trap() {
+        for f in ${_TRAPPED_REBAR_TMP:-}; do
+            rm -f "$f" >/dev/null 2>&1 || true
+        done
+        _TRAPPED_REBAR_TMP=""
+        trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+    }
+    trap '_rebar_cleanup_trap' INT TERM
+
+    if ! $virsh_cmd dumpxml --inactive "$vm_name" > "$orig_xml" 2>/dev/null; then
+        log "ERROR" "Failed to dump XML for VM '$vm_name'."
+        rm -f "$tmp_xml" "$orig_xml"
+        _TRAPPED_REBAR_TMP=""
+        trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+        return 1
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$orig_xml" "$tmp_xml" <<'PYEOF'
+import sys, re
+infile, outfile = sys.argv[1], sys.argv[2]
+with open(infile, 'r') as f:
+    content = f.read()
+
+# Remove qemu:commandline block containing X-PciMmio64Mb
+content = re.sub(
+    r'\s*<qemu:commandline>\s*<qemu:arg[^>]*?/>\s*<qemu:arg[^>]*?X-PciMmio64Mb[^>]*?/>\s*</qemu:commandline>',
+    '',
+    content,
+    flags=re.DOTALL
+)
+
+# Remove xmlns:qemu if no more qemu: elements
+if '<qemu:' not in content:
+    content = re.sub(r'\s+xmlns:qemu="http://libvirt\.org/schemas/domain/qemu/1\.0"', '', content)
+
+with open(outfile, 'w') as f:
+    f.write(content)
+PYEOF
+    elif command -v perl >/dev/null 2>&1; then
+        perl -0777 -pe "
+            s/\\s*<qemu:commandline>.*?<\\/qemu:commandline>//s;
+            s/\\s+xmlns:qemu=\\\"http:\\/\\/libvirt\\.org\\/schemas\\/domain\\/qemu\\/1\\.0\\\"//g if !/<qemu:/;
+        " "$orig_xml" > "$tmp_xml"
+    else
+        log "ERROR" "Neither python3 nor perl is available. Cannot modify VM XML."
+        rm -f "$tmp_xml" "$orig_xml"
+        _TRAPPED_REBAR_TMP=""
+        trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+        return 1
+    fi
+
+    if ! $virsh_cmd define "$tmp_xml" 2>/dev/null; then
+        log "ERROR" "Failed to redefine VM '$vm_name' after removing ReBAR configuration."
+        rm -f "$tmp_xml" "$orig_xml"
+        _TRAPPED_REBAR_TMP=""
+        trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+        return 1
+    fi
+
+    rm -f "$tmp_xml" "$orig_xml"
+    _TRAPPED_REBAR_TMP=""
+    trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+
+    log "SUCCESS" "ReBAR 64-bit MMIO disabled on VM '$vm_name'."
+}
+
+configure_vm_rebar() {
+    local vm_list selected_vm
+    local virsh_cmd="virsh"
+
+    if ! command -v virsh >/dev/null 2>&1; then
+        log "INFO" "virsh not found. Skipping ReBAR VM configuration."
+        return 0
+    fi
+
+    if virsh -c qemu:///system list --all >/dev/null 2>&1; then
+        virsh_cmd="virsh -c qemu:///system"
+        log "INFO" "Using libvirt system connection (qemu:///system)."
+    elif virsh -c qemu:///session list --all >/dev/null 2>&1; then
+        virsh_cmd="virsh -c qemu:///session"
+        log "INFO" "Using libvirt session connection (qemu:///session)."
+    else
+        log "WARN" "Cannot connect to libvirt. Skipping ReBAR configuration."
+        return 0
+    fi
+
+    log "INFO" "Scanning libvirt virtual machines for ReBAR configuration…"
+    mapfile -t vm_list < <($virsh_cmd list --all --name | grep -v '^$' || true)
+    if [[ ${#vm_list[@]} -eq 0 ]]; then
+        log "WARN" "No libvirt VMs found. Skipping ReBAR configuration."
+        return 0
+    fi
+
+    local selected_vm=""
+    if [[ -n "$VM_NAME" ]]; then
+        local vm_found=false
+        for vm in "${vm_list[@]}"; do
+            if [[ "$vm" == "$VM_NAME" ]]; then
+                vm_found=true
+                break
+            fi
+        done
+        if [[ "$vm_found" == true ]]; then
+            selected_vm="$VM_NAME"
+            log "INFO" "Using explicitly specified VM '$selected_vm' (--vm-name)."
+        else
+            log "WARN" "VM '$VM_NAME' not found. Falling back to selection."
+        fi
+    fi
+
+    if [[ -z "$selected_vm" ]]; then
+        local menu_items=()
+        local vm i=1
+        for vm in "${vm_list[@]}"; do
+            local state rebar_info
+            state="$($virsh_cmd domstate "$vm" 2>/dev/null || echo "unknown")"
+            if vm_has_rebar_config "$vm" "$virsh_cmd"; then
+                rebar_info=" [ReBAR enabled]"
+            else
+                rebar_info=" [ReBAR not configured]"
+            fi
+            menu_items+=("$i" "$vm ($state)${rebar_info}")
+            i=$((i+1))
+        done
+        menu_items+=("0" "Skip ReBAR configuration")
+
+        local selected_idx
+        selected_idx="$(tui_menu "Select VM for ReBAR" "Which VM should have ReBAR 64-bit MMIO configured?" "" "${menu_items[@]}")"
+        if [[ -z "$selected_idx" || "$selected_idx" == "0" ]]; then
+            log "INFO" "Skipping ReBAR configuration."
+            return 0
+        fi
+        selected_vm="${vm_list[$((selected_idx-1))]}"
+    fi
+
+    log "INFO" "Targeting VM: $selected_vm"
+
+    if vm_has_rebar_config "$selected_vm" "$virsh_cmd"; then
+        log "SUCCESS" "VM '$selected_vm' already has ReBAR 64-bit MMIO configured."
+        local action
+        if [[ "$YES" == true ]]; then
+            action="keep"
+        elif [[ "$TUI_BACKEND" != "none" && "$TUI_BACKEND" != "" && "$DRY_RUN" != true ]]; then
+            action="$(tui_menu "ReBAR Configuration" "VM '$selected_vm' already has ReBAR enabled. What do you want to do?" "" \
+                "keep" "Keep current ReBAR configuration" \
+                "disable" "Disable ReBAR configuration")"
+        else
+            action="keep"
+        fi
+        case "$action" in
+            disable)
+                disable_vm_rebar "$selected_vm" "$virsh_cmd" "$DRY_RUN"
+                ;;
+            keep|"")
+                log "INFO" "Kept existing ReBAR configuration on '$selected_vm'."
+                ;;
+        esac
+    else
+        log "INFO" "VM '$selected_vm' does not have ReBAR configured."
+        local action
+        if [[ "$YES" == true ]]; then
+            action="enable"
+        elif [[ "$TUI_BACKEND" != "none" && "$TUI_BACKEND" != "" && "$DRY_RUN" != true ]]; then
+            action="$(tui_menu "ReBAR Configuration" "Enable ReBAR 64-bit MMIO (64GB aperture) on VM '$selected_vm'?" "" \
+                "enable" "Enable ReBAR (recommended for large GPUs)" \
+                "skip" "Skip ReBAR configuration")"
+        else
+            if [[ "$DRY_RUN" == true ]]; then
+                action="enable"
+            else
+                log "INFO" "ReBAR not configured. Use --enable-rebar or run interactively to enable."
+                action="skip"
+            fi
+        fi
+        case "$action" in
+            enable)
+                enable_vm_rebar "$selected_vm" "$virsh_cmd" "$DRY_RUN"
+                ;;
+            skip|"")
+                log "INFO" "Skipped ReBAR configuration for '$selected_vm'."
+                ;;
+        esac
+    fi
+}
+
+do_rebar_standalone() {
+    local action="$1"
+
+    if [[ $EUID -ne 0 ]]; then
+        log "ERROR" "This action must be run as root. Please use sudo."
+        exit 1
+    fi
+
+    local virsh_cmd="virsh"
+    if ! command -v virsh >/dev/null 2>&1; then
+        log "ERROR" "virsh not found. Cannot configure ReBAR."
+        exit 1
+    fi
+
+    if virsh -c qemu:///system list --all >/dev/null 2>&1; then
+        virsh_cmd="virsh -c qemu:///system"
+    elif virsh -c qemu:///session list --all >/dev/null 2>&1; then
+        virsh_cmd="virsh -c qemu:///session"
+    else
+        log "ERROR" "Cannot connect to libvirt. Cannot configure ReBAR."
+        exit 1
+    fi
+
+    local vm_list selected_vm
+    mapfile -t vm_list < <($virsh_cmd list --all --name | grep -v '^$' || true)
+    if [[ ${#vm_list[@]} -eq 0 ]]; then
+        log "ERROR" "No libvirt VMs found."
+        exit 1
+    fi
+
+    selected_vm=""
+    if [[ -n "$VM_NAME" ]]; then
+        for vm in "${vm_list[@]}"; do
+            if [[ "$vm" == "$VM_NAME" ]]; then
+                selected_vm="$VM_NAME"
+                break
+            fi
+        done
+        if [[ -z "$selected_vm" ]]; then
+            log "ERROR" "VM '$VM_NAME' not found."
+            exit 1
+        fi
+    else
+        local menu_items=()
+        local vm i=1
+        for vm in "${vm_list[@]}"; do
+            local state rebar_info
+            state="$($virsh_cmd domstate "$vm" 2>/dev/null || echo "unknown")"
+            if vm_has_rebar_config "$vm" "$virsh_cmd"; then
+                rebar_info=" [ReBAR enabled]"
+            else
+                rebar_info=" [ReBAR not configured]"
+            fi
+            menu_items+=("$i" "$vm ($state)${rebar_info}")
+            i=$((i+1))
+        done
+        menu_items+=("0" "Cancel")
+
+        local selected_idx
+        selected_idx="$(tui_menu "Select VM for ReBAR" "Which VM should be modified?" "" "${menu_items[@]}")"
+        if [[ -z "$selected_idx" || "$selected_idx" == "0" ]]; then
+            log "INFO" "Cancelled."
+            exit 0
+        fi
+        selected_vm="${vm_list[$((selected_idx-1))]}"
+    fi
+
+    if [[ "$action" == "enable" ]]; then
+        if vm_has_rebar_config "$selected_vm" "$virsh_cmd"; then
+            log "SUCCESS" "VM '$selected_vm' already has ReBAR 64-bit MMIO configured."
+            exit 0
+        fi
+        enable_vm_rebar "$selected_vm" "$virsh_cmd" "$DRY_RUN"
+    else
+        if ! vm_has_rebar_config "$selected_vm" "$virsh_cmd"; then
+            log "WARN" "VM '$selected_vm' does not have ReBAR configured. Nothing to disable."
+            exit 0
+        fi
+        disable_vm_rebar "$selected_vm" "$virsh_cmd" "$DRY_RUN"
+    fi
+}
+
 remove_shmem_from_vm() {
     local vm_name="$1"
     local virsh_cmd="$2"
@@ -1304,6 +1706,7 @@ do_install() {
     generate_user_config
     configure_libvirt_vm
     resize_shared_memory "${LG_SHMEM_SIZE:-64}"
+    configure_vm_rebar
     install_shell_completions
     create_desktop_entry
 
@@ -1473,6 +1876,15 @@ do_uninstall() {
             log "WARN" "You MUST manually remove the 'ivshmem' device from these VMs in virt-manager."
             log "WARN" "If you do not remove it, the VMs will refuse to boot because the shared memory file is gone!"
         fi
+
+        # ReBAR orphan check
+        while IFS= read -r vm_name; do
+            [[ -z "$vm_name" ]] && continue
+            if $virsh_uninstall dumpxml "$vm_name" 2>/dev/null | grep -q "X-PciMmio64Mb"; then
+                log "WARN" "VM '$vm_name' still has ReBAR 64-bit MMIO configuration (X-PciMmio64Mb)."
+                log "WARN" "You may want to remove this manually in virt-manager if ReBAR is no longer needed."
+            fi
+        done < <($virsh_uninstall list --all --name 2>/dev/null || true)
     fi
 
     log "SUCCESS" "Looking Glass has been successfully uninstalled."
@@ -1522,6 +1934,14 @@ parse_args() {
                 LG_SHMEM_SIZE="$2"
                 shift 2
                 ;;
+            --enable-rebar)
+                do_rebar_standalone "enable"
+                exit 0
+                ;;
+            --disable-rebar)
+                do_rebar_standalone "disable"
+                exit 0
+                ;;
             --help|-h)
                 cat <<EOF
 Usage: sudo ./${SCRIPT_NAME} [OPTIONS]
@@ -1537,6 +1957,8 @@ Options:
   --yes, -y              Skip confirmation prompts (use with caution!).
   --vm-name <name>       Explicitly target a VM by name (bypasses auto-select).
   --shmem-size <MB>      Shared-memory pool size (default: 64). Common: 64 (1080p), 128 (1440p), 256 (4K), 512 (UW 4K).
+  --enable-rebar         Enable ReBAR 64-bit MMIO (64GB aperture) on a VM.
+  --disable-rebar        Disable ReBAR 64-bit MMIO configuration from a VM.
   --help, -h             Show this help text.
 EOF
                 exit 0

@@ -62,14 +62,16 @@ assert_contains "$out" "Usage:" "--help shows usage"
 assert_contains "$out" "--install-script" "--help mentions --install-script"
 assert_contains "$out" "--self-remove" "--help mentions --self-remove"
 assert_contains "$out" "--create-shortcut" "--help mentions --create-shortcut"
+assert_contains "$out" "--enable-rebar" "--help mentions --enable-rebar"
+assert_contains "$out" "--disable-rebar" "--help mentions --disable-rebar"
 
 # Test: unknown option exits with error
 out=$(bash "$SCRIPT" --bogus 2>&1 || true)
 assert_contains "$out" "Unknown option" "unknown flag rejected"
 
-# Test: --dry-run does not require root (but should error early on root check)
+# Test: --dry-run auto-elevates with sudo when not root
 out=$(bash "$SCRIPT" --dry-run --yes 2>&1 || true)
-assert_contains "$out" "must be run as root" "--dry-run still respects root check"
+assert_contains "$out" "Re-launching with sudo" "--dry-run auto-elevates when not root"
 
 echo ""
 echo "--- Test Group: Self-Deployment ---"

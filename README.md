@@ -61,6 +61,10 @@ Options:
   --dry-run              Show what would be done without touching the system.
   --no-tui               Disable TUI (whiptail/dialog) and use plain text prompts.
   --yes, -y              Skip confirmation prompts (use with caution!).
+  --vm-name <name>       Explicitly target a VM by name (bypasses auto-select).
+  --shmem-size <MB>      Shared-memory pool size (default: 64). Common: 64 (1080p), 128 (1440p), 256 (4K), 512 (UW 4K).
+  --enable-rebar         Enable ReBAR 64-bit MMIO (64GB aperture) on a VM.
+  --disable-rebar        Disable ReBAR 64-bit MMIO configuration from a VM.
   --help, -h             Show this help text.
 ```
 
@@ -107,7 +111,9 @@ When you run the script it follows a strict pipeline:
 
 10. **VM Auto-Configuration (`configure_libvirt_vm`)** — If `virsh` is available and connected, the script lists all VMs, presents them in a TUI menu with numeric indices (so VM names with spaces do not break the menu), and lets the user pick one. It checks the VM XML for existing `ivshmem-plain` devices. If **more than one** is found (e.g. from a previous incomplete swap), the script warns and **loops removal** until none remain, then attaches the correct single device. If only one exists with a different size than requested, it removes the old device before attaching the new one. The temporary XML file is protected by a trap that cleans it up on `SIGINT`/`SIGTERM`. After attachment, the script warns that a **full cold shutdown** (not a restart) is required for the hardware to appear.
 
-11. **Shell Completions (`install_shell_completions`)** — Installs Fish completions to `/usr/share/fish/vendor_completions.d/looking-glass-setup.fish` and Bash completions to `/usr/share/bash-completion/completions/looking-glass-setup`. Both are generated from the current flag list and are cleaned up during `--self-remove`.
+11. **ReBAR VM Configuration (`configure_vm_rebar`)** — Prompts to enable or disable ReBAR 64-bit MMIO on the target VM. When enabled, the script adds `xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0"` to the `<domain>` element and inserts `<qemu:commandline>` with `-fw_cfg opt/ovmf/X-PciMmio64Mb,string=65536` between `</devices>` and `</domain>`. This creates a 64GB PCI MMIO aperture so large GPUs (e.g., 16GB with ReBAR) do not black-screen. The script first checks whether the VM already has the ReBAR block. If it does, it offers to keep or remove it; if not, it offers to enable or skip. Disable removes the block and cleans up the namespace when no other QEMU elements remain. Both enable and disable use python3 for precise XML transformation, with perl as a fallback. The installer also warns that a full cold shutdown is required for the change to take effect.
+
+12. **Shell Completions (`install_shell_completions`)** — Installs Fish completions to `/usr/share/fish/vendor_completions.d/looking-glass-setup.fish` and Bash completions to `/usr/share/bash-completion/completions/looking-glass-setup`. Both are generated from the current flag list and are cleaned up during `--self-remove`.
 
 ### Idempotency & Safety
 
@@ -120,6 +126,15 @@ The script is designed to be **safe to re-run** without side effects:
 - **Confirmation gates** — `confirm_or_exit` pauses before any package install, uninstall, or system modification unless `--yes` is passed.
 - **Error traps** — `set -euo pipefail` is active. An `ERR` trap logs the exact line number and exit code. `INT`/`TERM` traps log a clean abort message.
 - **Process termination** — During uninstall, the script uses `pgrep` to detect `looking-glass-client`, then sends `TERM` followed by `KILL` if needed, using `pkill -x` (POSIX, no dependency on `killall`).
+
+### ReBAR Memory
+
+ReBAR (Resizable BAR) allows the CPU to access the entire GPU VRAM instead of a small 256MB window. For passthrough VMs with large GPUs (8GB+), enabling ReBAR in the BIOS can cause a black screen if the VM's PCI MMIO aperture is too small. The script automates the libvirt QEMU workaround:
+
+- **Enable** — `sudo ./look-setup.sh --enable-rebar` (or via TUI menu) targets the VM, adds the QEMU namespace, and injects the `X-PciMmio64Mb=65536` fw_cfg parameter. This expands the aperture to 64GB.
+- **Disable** — `sudo ./look-setup.sh --disable-rebar` cleanly removes the injected XML block.
+- **Pre-check** — The script refuses to double-inject; it checks the VM XML for existing ReBAR configuration before adding anything.
+- **Requirement** — You must still enable *Above 4G Decoding* and *Resize BAR* in the VM BIOS / UEFI for this to take effect. The script only prepares the virtual motherboard to accommodate it.
 
 ### Uninstall Safety
 
