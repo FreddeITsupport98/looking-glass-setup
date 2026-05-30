@@ -484,17 +484,39 @@ detect_tui_backend() {
 tui_yesno() {
     local title="$1"
     local text="$2"
+    local result=1
     case "$TUI_BACKEND" in
         whiptail)
-            whiptail --title "$title" --yesno "$text" 10 60
+            local rc=0
+            whiptail --title "$title" --yesno "$text" 10 60 3>&1 1>&2 2>&3 || rc=$?
+            if [[ "$rc" -eq 0 ]]; then
+                result=0
+            elif [[ "$rc" -ne 1 ]]; then
+                log "WARN" "whiptail failed (exit $rc, TTY issue?); falling back to text prompt."
+                TUI_BACKEND="none"
+                if tui_yesno "$title" "$text"; then
+                    result=0
+                fi
+            fi
             ;;
         dialog)
-            dialog --title "$title" --yesno "$text" 10 60
+            local rc=0
+            dialog --title "$title" --yesno "$text" 10 60 3>&1 1>&2 2>&3 || rc=$?
+            if [[ "$rc" -eq 0 ]]; then
+                result=0
+            elif [[ "$rc" -ne 1 ]]; then
+                log "WARN" "dialog failed (exit $rc, TTY issue?); falling back to text prompt."
+                TUI_BACKEND="none"
+                if tui_yesno "$title" "$text"; then
+                    result=0
+                fi
+            fi
             ;;
         *)
-            return 1
+            result=1
             ;;
     esac
+    return "$result"
 }
 
 tui_menu() {
@@ -505,17 +527,29 @@ tui_menu() {
     local result=""
     case "$TUI_BACKEND" in
         whiptail)
+            local rc=0
             if [[ -n "$default_item" ]]; then
-                result=$(whiptail --title "$title" --default-item "$default_item" --menu "$text" 20 70 10 "$@" 3>&1 1>&2 2>&3) || true
+                result=$(whiptail --title "$title" --default-item "$default_item" --menu "$text" 20 70 10 "$@" 3>&1 1>&2 2>&3) || rc=$?
             else
-                result=$(whiptail --title "$title" --menu "$text" 20 70 10 "$@" 3>&1 1>&2 2>&3) || true
+                result=$(whiptail --title "$title" --menu "$text" 20 70 10 "$@" 3>&1 1>&2 2>&3) || rc=$?
+            fi
+            if [[ "$rc" -ne 0 && "$rc" -ne 1 ]]; then
+                log "WARN" "whiptail failed (exit $rc, TTY issue?); falling back to text prompt."
+                TUI_BACKEND="none"
+                result=$(tui_menu "$title" "$text" "$default_item" "$@")
             fi
             ;;
         dialog)
+            local rc=0
             if [[ -n "$default_item" ]]; then
-                result=$(dialog --title "$title" --default-item "$default_item" --menu "$text" 20 70 10 "$@" 3>&1 1>&2 2>&3) || true
+                result=$(dialog --title "$title" --default-item "$default_item" --menu "$text" 20 70 10 "$@" 3>&1 1>&2 2>&3) || rc=$?
             else
-                result=$(dialog --title "$title" --menu "$text" 20 70 10 "$@" 3>&1 1>&2 2>&3) || true
+                result=$(dialog --title "$title" --menu "$text" 20 70 10 "$@" 3>&1 1>&2 2>&3) || rc=$?
+            fi
+            if [[ "$rc" -ne 0 && "$rc" -ne 1 ]]; then
+                log "WARN" "dialog failed (exit $rc, TTY issue?); falling back to text prompt."
+                TUI_BACKEND="none"
+                result=$(tui_menu "$title" "$text" "$default_item" "$@")
             fi
             ;;
         *)
@@ -622,8 +656,10 @@ preflight_hardware() {
     if [[ ! -d /sys/kernel/iommu_groups ]] || [[ -z "$(ls -A /sys/kernel/iommu_groups 2>/dev/null || true)" ]]; then
         log "WARN" "IOMMU groups not found. VFIO GPU passthrough will not work until IOMMU is enabled in your bootloader."
     fi
-    if ! lsmod | grep -q "kvm"; then
-        log "WARN" "KVM kernel module is not loaded. Virtualization may be disabled in BIOS."
+    if ! lsmod | grep -q "kvm" && [[ ! -c /dev/kvm ]]; then
+        log "WARN" "KVM kernel module is not loaded and /dev/kvm is missing. Virtualization may be disabled in BIOS."
+    elif ! lsmod | grep -q "kvm" && [[ -c /dev/kvm ]]; then
+        log "INFO" "KVM appears built into the kernel (/dev/kvm present, no loaded kvm module)."
     fi
     if ! lsmod | grep -q "vfio_pci"; then
         log "WARN" "vfio_pci kernel module is not loaded. GPU Passthrough may not be configured."
@@ -808,18 +844,54 @@ resize_shared_memory() {
         return 0
     fi
 
-    if [[ ! -e /dev/shm/looking-glass ]]; then
-        touch /dev/shm/looking-glass
+    # If the existing node has a restrictive SELinux type (e.g. svirt_tmpfs_t),
+    # even root may get EPERM. Remove and recreate to get a writable tmpfs node,
+    # then re-apply the QEMU SELinux context afterward.
+    if [[ -e /dev/shm/looking-glass ]]; then
+        rm -f /dev/shm/looking-glass
+    fi
+    if ! touch /dev/shm/looking-glass; then
+        log "WARN" "Cannot create /dev/shm/looking-glass as root."
     fi
 
     local resized=false
-    if truncate -s "${size}M" /dev/shm/looking-glass 2>/dev/null; then
+    local truncate_err fallocate_err
+    truncate_err="$(mktemp)"
+    fallocate_err="$(mktemp)"
+    if truncate -s "${size}M" /dev/shm/looking-glass 2>"$truncate_err"; then
         resized=true
-    elif fallocate -l "${size}M" /dev/shm/looking-glass 2>/dev/null; then
+    elif fallocate -l "${size}M" /dev/shm/looking-glass 2>"$fallocate_err"; then
         resized=true
     else
-        log "WARN" "Failed to resize /dev/shm/looking-glass (it may be in use by a running VM). Try shutting down the VM and re-running."
+        local te fe
+        te="$(cat "$truncate_err" 2>/dev/null || true)"
+        fe="$(cat "$fallocate_err" 2>/dev/null || true)"
+        log "WARN" "Failed to resize /dev/shm/looking-glass (truncate: ${te:-unknown}, fallocate: ${fe:-unknown})."
+        if command -v lsof >/dev/null 2>&1; then
+            local open_procs
+            open_procs="$(lsof /dev/shm/looking-glass 2>/dev/null || true)"
+            if [[ -n "$open_procs" ]]; then
+                log "WARN" "File is open by another process:"
+                printf '%s\n' "$open_procs" | while IFS= read -r line; do
+                    log "WARN" "  $line"
+                done
+            fi
+        fi
+        if command -v dd >/dev/null 2>&1; then
+            log "INFO" "Attempting dd fallback to resize shared-memory file…"
+            if dd if=/dev/zero of=/dev/shm/looking-glass bs=1M count="$size" conv=notrunc 2>/dev/null; then
+                resized=true
+                log "SUCCESS" "Resized shared-memory file using dd fallback."
+            else
+                log "WARN" "dd fallback also failed."
+            fi
+        fi
+        if [[ "$resized" != true ]]; then
+            log "WARN" "Try: rm -f /dev/shm/looking-glass && systemd-tmpfiles --create /etc/tmpfiles.d/10-looking-glass.conf"
+            log "WARN" "Or shut down any running VM and re-run."
+        fi
     fi
+    rm -f "$truncate_err" "$fallocate_err"
 
     if [[ -e /dev/shm/looking-glass ]]; then
         chown "$qemu_user:$qemu_group" /dev/shm/looking-glass 2>/dev/null || true
@@ -2429,7 +2501,13 @@ configure_libvirt_vm() {
         fi
     fi
 
-    # Always show interactive selection unless --vm-name was valid
+    # Auto-select single VM when --yes is set and no --vm-name given
+    if [[ -z "$selected_vm" && "$YES" == true && ${#vm_list[@]} -eq 1 ]]; then
+        selected_vm="${vm_list[0]}"
+        log "INFO" "Auto-selected only VM '$selected_vm' (--yes active, single VM)."
+    fi
+
+    # Always show interactive selection unless --vm-name was valid or auto-selected above
     if [[ -z "$selected_vm" ]]; then
         local menu_items=()
         local vm i=1
@@ -2673,6 +2751,9 @@ do_install() {
     log "INFO" "  Command to run:         looking-glass-client"
     if [[ -n "${selected_vm:-}" ]]; then
         log "INFO" "  Target VM:              $selected_vm"
+    fi
+    if [[ -z "${LG_SHMEM_SIZE:-}" ]]; then
+        LG_SHMEM_SIZE="64"
     fi
     log "INFO" "  Shared-memory size:     ${LG_SHMEM_SIZE}MB"
     log "INFO" "────────────────────────────────────────"
