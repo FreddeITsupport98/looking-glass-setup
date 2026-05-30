@@ -20,6 +20,8 @@ NO_TUI=false
 TUI_BACKEND="none"
 VM_NAME=""
 LG_SHMEM_SIZE=""
+VBIOS_DIR="/var/lib/libvirt/vbios"
+VBIOS_FILE=""
 
 # --- Colors -----------------------------------------------------------------
 C_RED='\033[0;31m'
@@ -176,6 +178,9 @@ install_script() {
         log "INFO" "  sudo looking-glass-setup --help         # Show full help"
         log "INFO" "  sudo looking-glass-setup --enable-rebar    # Enable ReBAR 64-bit MMIO on VM"
         log "INFO" "  sudo looking-glass-setup --disable-rebar   # Disable ReBAR 64-bit MMIO on VM"
+        log "INFO" "  sudo looking-glass-setup --dump-vbios      # Dump GPU VBIOS ROM"
+        log "INFO" "  sudo looking-glass-setup --inject-vbios  # Inject VBIOS into VM GPU passthrough"
+        log "INFO" "  sudo looking-glass-setup --remove-vbios  # Remove VBIOS from VM GPU passthrough"
     else
         log "ERROR" "Failed to copy script to $INSTALLED_PATH. Are you root?"
         return 1
@@ -296,6 +301,10 @@ complete -c looking-glass-setup -l vm-name -d "Target VM by name (e.g. --vm-name
 complete -c looking-glass-setup -l shmem-size -d "Pool size in MB: 64/128/256/512"
 complete -c looking-glass-setup -l enable-rebar -d "Enable ReBAR 64-bit MMIO on VM"
 complete -c looking-glass-setup -l disable-rebar -d "Disable ReBAR 64-bit MMIO on VM"
+complete -c looking-glass-setup -l dump-vbios -d "Dump GPU VBIOS ROM"
+complete -c looking-glass-setup -l inject-vbios -d "Inject VBIOS ROM into VM GPU passthrough"
+complete -c looking-glass-setup -l remove-vbios -d "Remove VBIOS ROM from VM GPU passthrough"
+complete -c looking-glass-setup -l vbios-path -d "Path to VBIOS .rom file"
 complete -c looking-glass-setup -l help -s h -d "Show help"
 FISH
             log "SUCCESS" "Fish completions installed to $fish_dir"
@@ -316,7 +325,7 @@ FISH
             cat > "$bash_dir/looking-glass-setup" <<'BASH'
 _looking_glass_setup_completions() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
-    local opts="--install-script --self-remove --create-shortcut --uninstall --eject --install-completions --dry-run --no-tui --yes -y --vm-name --shmem-size --enable-rebar --disable-rebar --help -h"
+    local opts="--install-script --self-remove --create-shortcut --uninstall --eject --install-completions --dry-run --no-tui --yes -y --vm-name --shmem-size --enable-rebar --disable-rebar --dump-vbios --inject-vbios --remove-vbios --vbios-path --help -h"
     COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
 }
 complete -F _looking_glass_setup_completions looking-glass-setup
@@ -339,6 +348,9 @@ show_main_menu() {
     menu_items+=("deploy" "Install Script to PATH")
     menu_items+=("enable_rebar" "Enable ReBAR on VM")
     menu_items+=("disable_rebar" "Disable ReBAR on VM")
+    menu_items+=("dump_vbios" "Dump GPU VBIOS")
+    menu_items+=("inject_vbios" "Inject VBIOS to VM")
+    menu_items+=("remove_vbios" "Remove VBIOS from VM")
     menu_items+=("exit" "Exit")
     choice="$(tui_menu "Looking Glass Manager" "Select an action:" "" "${menu_items[@]}")"
     case "$choice" in
@@ -378,6 +390,26 @@ show_main_menu() {
                 exit 1
             fi
             do_rebar_standalone "disable"
+            exit 0
+            ;;
+        dump_vbios)
+            do_vbios_dump_standalone
+            exit 0
+            ;;
+        inject_vbios)
+            if [[ $EUID -ne 0 ]]; then
+                log "ERROR" "This action must be run as root. Please use sudo."
+                exit 1
+            fi
+            do_vbios_inject_standalone "inject"
+            exit 0
+            ;;
+        remove_vbios)
+            if [[ $EUID -ne 0 ]]; then
+                log "ERROR" "This action must be run as root. Please use sudo."
+                exit 1
+            fi
+            do_vbios_inject_standalone "remove"
             exit 0
             ;;
         exit|"")
@@ -1305,6 +1337,729 @@ do_rebar_standalone() {
     fi
 }
 
+detect_vfio_gpus() {
+    local gpus=()
+    if command -v lspci >/dev/null 2>&1; then
+        while IFS= read -r line; do
+            local addr driver_path driver_name
+            addr="$(echo "$line" | awk '{print $1}')"
+            [[ -z "$addr" ]] && continue
+            driver_path="/sys/bus/pci/devices/$addr/driver"
+            driver_name=""
+            if [[ -L "$driver_path" ]]; then
+                driver_name="$(basename "$(readlink -f "$driver_path" 2>/dev/null)" 2>/dev/null || true)"
+            fi
+            if [[ "$driver_name" == "vfio-pci" ]]; then
+                gpus+=("$addr")
+            fi
+        done < <(lspci -D -nn | grep -iE 'vga compatible controller|3d controller' || true)
+    fi
+    printf '%s\n' "${gpus[@]}"
+}
+
+detect_all_gpus() {
+    local gpus=()
+    if command -v lspci >/dev/null 2>&1; then
+        while IFS= read -r line; do
+            local addr
+            addr="$(echo "$line" | awk '{print $1}')"
+            [[ -n "$addr" ]] && gpus+=("$addr")
+        done < <(lspci -D -nn | grep -iE 'vga compatible controller|3d controller' || true)
+    fi
+    printf '%s\n' "${gpus[@]}"
+}
+
+get_gpu_driver_name() {
+    local pci_addr="$1"
+    local driver_path="/sys/bus/pci/devices/$pci_addr/driver"
+    if [[ -L "$driver_path" ]]; then
+        basename "$(readlink -f "$driver_path" 2>/dev/null)" 2>/dev/null || true
+    fi
+}
+
+gpu_is_vfio() {
+    local pci_addr="$1"
+    [[ "$(get_gpu_driver_name "$pci_addr")" == "vfio-pci" ]]
+}
+
+get_vm_vbios_rom_path() {
+    local vm_name="$1"
+    local virsh_cmd="$2"
+    local xml
+    xml="$($virsh_cmd dumpxml --inactive "$vm_name" 2>/dev/null || true)"
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c "
+import sys, re
+xml = sys.argv[1]
+matches = re.findall(r\"<hostdev[^>]*type\\s*=\\s*['\\\"]pci['\\\"][^>]*>.*?</hostdev>\", xml, flags=re.DOTALL)
+for m in matches:
+    rom = re.search(r\"<rom\\s+file\\s*=\\s*['\\\"]([^'\\\"]*)['\\\"]\\s*/>\", m)
+    if rom:
+        print(rom.group(1))
+        break
+" "$xml" 2>/dev/null || true
+    fi
+}
+
+vm_has_vbios_config() {
+    local vm_name="$1"
+    local virsh_cmd="$2"
+    local xml
+    xml="$($virsh_cmd dumpxml --inactive "$vm_name" 2>/dev/null || true)"
+    if [[ "$xml" == *"<hostdev"* && "$xml" == *"type='pci'"* && "$xml" == *"<rom file="* ]]; then
+        return 0
+    fi
+    return 1
+}
+
+vm_vbios_is_same_rom() {
+    local vm_name="$1"
+    local virsh_cmd="$2"
+    local rom_path="$3"
+    local existing_rom
+    existing_rom="$(get_vm_vbios_rom_path "$vm_name" "$virsh_cmd")"
+    if [[ "$existing_rom" == "$rom_path" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+pci_hostdev_has_rom_block() {
+    local xml="$1"
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c "
+import sys, re
+xml = sys.argv[1]
+matches = re.findall(r\"<hostdev[^>]*type\\s*=\\s*['\\\"]pci['\\\"][^>]*>.*?</hostdev>\", xml, flags=re.DOTALL)
+has_rom = False
+for m in matches:
+    if re.search(r\"<rom\\s+file\\s*=\\s*['\\\"][^'\\\"]*['\\\"]\\s*/>\", m):
+        has_rom = True
+    else:
+        has_rom = False
+        break
+print('yes' if has_rom else 'no')
+" "$xml" 2>/dev/null || echo "no"
+    else
+        echo "no"
+    fi
+}
+
+dump_vbios() {
+    local pci_addr="$1"
+    local target_dir="${2:-$VBIOS_DIR}"
+    local rom_file="/sys/bus/pci/devices/$pci_addr/rom"
+    local output_file="$target_dir/vbios_${pci_addr//:/_}.rom"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log "INFO" "[DRY-RUN] Would dump VBIOS from $pci_addr to $output_file"
+        printf '%s' "$output_file"
+        return 0
+    fi
+
+    if [[ ! -d "$target_dir" ]]; then
+        mkdir -p "$target_dir" || {
+            log "ERROR" "Cannot create $target_dir"
+            return 1
+        }
+    fi
+
+    if [[ ! -f "$rom_file" ]]; then
+        log "WARN" "ROM sysfs node not found at $rom_file."
+        log "INFO" "The GPU must be bound to a driver that exposes the ROM (e.g., amdgpu) for dumping."
+        log "INFO" "If currently bound to vfio-pci, you may need to temporarily rebind to amdgpu first."
+        return 1
+    fi
+
+    log "INFO" "Enabling ROM reading for $pci_addr…"
+    if ! echo 1 > "$rom_file" 2>/dev/null; then
+        local drv
+        drv="$(get_gpu_driver_name "$pci_addr")"
+        if [[ "$drv" == "vfio-pci" ]]; then
+            log "WARN" "GPU $pci_addr is bound to vfio-pci — the ROM sysfs node is disabled."
+            log "INFO" "To dump the VBIOS, temporarily rebind the GPU to its native driver:"
+            log "INFO" "  echo '$pci_addr' > /sys/bus/pci/drivers/vfio-pci/unbind"
+            log "INFO" "  echo 1 > /sys/bus/pci/rescan   # or bind to native driver manually"
+        else
+            log "WARN" "Cannot enable ROM reading for $pci_addr (driver: ${drv:-unknown})."
+        fi
+        return 1
+    fi
+
+    log "INFO" "Reading VBIOS from $pci_addr…"
+    if cat "$rom_file" > "$output_file" 2>/dev/null; then
+        local rom_size
+        rom_size="$(stat -c %s "$output_file" 2>/dev/null || echo 0)"
+        if [[ "$rom_size" -lt 65536 ]]; then
+            log "WARN" "Dumped ROM is only ${rom_size} bytes — likely invalid. Removing."
+            rm -f "$output_file"
+            echo 0 > "$rom_file" 2>/dev/null || true
+            return 1
+        fi
+        log "SUCCESS" "VBIOS dumped: $output_file (${rom_size} bytes)"
+        echo 0 > "$rom_file" 2>/dev/null || true
+        printf '%s' "$output_file"
+        return 0
+    else
+        log "ERROR" "Failed to read ROM from $pci_addr."
+        echo 0 > "$rom_file" 2>/dev/null || true
+        return 1
+    fi
+}
+
+do_vbios_dump_standalone() {
+    if [[ $EUID -ne 0 ]]; then
+        log "ERROR" "This action must be run as root. Please use sudo."
+        exit 1
+    fi
+
+    local gpus=()
+    while IFS= read -r addr; do
+        [[ -n "$addr" ]] && gpus+=("$addr")
+    done < <(detect_vfio_gpus)
+
+    if [[ ${#gpus[@]} -eq 0 ]]; then
+        log "WARN" "No GPUs bound to vfio-pci detected. Falling back to all VGA/3D controllers."
+        while IFS= read -r addr; do
+            [[ -n "$addr" ]] && gpus+=("$addr")
+        done < <(detect_all_gpus)
+    fi
+
+    if [[ ${#gpus[@]} -eq 0 ]]; then
+        log "ERROR" "No VGA/3D controller GPUs detected via lspci."
+        exit 1
+    fi
+
+    local selected_addr=""
+    if [[ ${#gpus[@]} -eq 1 ]]; then
+        selected_addr="${gpus[0]}"
+        local drv
+        drv="$(get_gpu_driver_name "$selected_addr")"
+        log "INFO" "Only one GPU detected: $selected_addr (driver: ${drv:-unknown})"
+    else
+        local menu_items=()
+        local i=1
+        for addr in "${gpus[@]}"; do
+            local desc drv
+            desc="$(lspci -D -s "$addr" 2>/dev/null | cut -d' ' -f2- || echo "Unknown")"
+            drv="$(get_gpu_driver_name "$addr")"
+            if [[ "$drv" == "vfio-pci" ]]; then
+                menu_items+=("$i" "$addr — $desc [PASSTHROUGH]")
+            else
+                menu_items+=("$i" "$addr — $desc [driver: ${drv:-none}]")
+            fi
+            i=$((i+1))
+        done
+        menu_items+=("0" "Cancel")
+        local selected_idx
+        selected_idx="$(tui_menu "Dump VBIOS" "Select GPU to dump VBIOS from:" "" "${menu_items[@]}")"
+        if [[ -z "$selected_idx" || "$selected_idx" == "0" ]]; then
+            log "INFO" "Cancelled."
+            exit 0
+        fi
+        selected_addr="${gpus[$((selected_idx-1))]}"
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        dump_vbios "$selected_addr" "$VBIOS_DIR"
+        exit 0
+    fi
+
+    confirm_or_exit "This will attempt to read the VBIOS ROM from $selected_addr. Continue?"
+    local result
+    result="$(dump_vbios "$selected_addr" "$VBIOS_DIR")"
+    if [[ -n "$result" && -f "$result" ]]; then
+        log "SUCCESS" "VBIOS saved to: $result"
+    else
+        log "ERROR" "VBIOS dump failed."
+        exit 1
+    fi
+    exit 0
+}
+
+vm_has_vbios_config() {
+    local vm_name="$1"
+    local virsh_cmd="$2"
+    local xml
+    xml="$($virsh_cmd dumpxml --inactive "$vm_name" 2>/dev/null || true)"
+    if [[ "$xml" == *"<hostdev"* && "$xml" == *"type='pci'"* && "$xml" == *"<rom file="* ]]; then
+        return 0
+    fi
+    return 1
+}
+
+inject_vbios_to_vm() {
+    local vm_name="$1"
+    local virsh_cmd="$2"
+    local rom_path="$3"
+    local dry="${4:-false}"
+
+    if [[ "$dry" == true ]]; then
+        log "INFO" "[DRY-RUN] Would inject VBIOS $rom_path into VM '$vm_name'."
+        return 0
+    fi
+
+    # Idempotency: check if the exact same ROM is already injected
+    if vm_vbios_is_same_rom "$vm_name" "$virsh_cmd" "$rom_path"; then
+        log "SUCCESS" "VM '$vm_name' already has VBIOS '$rom_path' injected in all PCI passthrough devices."
+        return 0
+    fi
+
+    log "INFO" "Injecting VBIOS $rom_path into VM '$vm_name'…"
+
+    local tmp_xml orig_xml
+    tmp_xml="$(mktemp)"
+    orig_xml="$(mktemp)"
+    local _TRAPPED_VBIOS_TMP="$tmp_xml $orig_xml"
+    _vbios_cleanup_trap() {
+        for f in ${_TRAPPED_VBIOS_TMP:-}; do
+            rm -f "$f" >/dev/null 2>&1 || true
+        done
+        _TRAPPED_VBIOS_TMP=""
+        trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+    }
+    trap '_vbios_cleanup_trap' INT TERM
+
+    if ! $virsh_cmd dumpxml --inactive "$vm_name" > "$orig_xml" 2>/dev/null; then
+        log "ERROR" "Failed to dump XML for VM '$vm_name'."
+        rm -f "$tmp_xml" "$orig_xml"
+        _TRAPPED_VBIOS_TMP=""
+        trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+        return 1
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$orig_xml" "$tmp_xml" "$rom_path" <<'PYEOF'
+import sys, re
+infile, outfile, rom_path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(infile, 'r') as f:
+    content = f.read()
+
+def inject_rom_block(match):
+    block = match.group(0)
+    if re.search(r"<rom\s+file\s*=\s*['\"]", block):
+        block = re.sub(r"<rom\s+file\s*=\s*['\"][^'\"]*['\"]\s*/>", f"<rom file='{rom_path}'/>", block)
+        return block
+    block = block.replace('</source>', f"</source>\n  <rom file='{rom_path}'/>", 1)
+    return block
+
+content = re.sub(
+    r"<hostdev[^>]*type\s*=\s*['\"]pci['\"][^>]*>.*?</hostdev>",
+    inject_rom_block,
+    content,
+    flags=re.DOTALL
+)
+
+with open(outfile, 'w') as f:
+    f.write(content)
+PYEOF
+    else
+        log "ERROR" "python3 is required for VBIOS XML injection."
+        rm -f "$tmp_xml" "$orig_xml"
+        _TRAPPED_VBIOS_TMP=""
+        trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+        return 1
+    fi
+
+    if ! $virsh_cmd define "$tmp_xml" 2>/dev/null; then
+        log "ERROR" "Failed to redefine VM '$vm_name' with VBIOS injection."
+        rm -f "$tmp_xml" "$orig_xml"
+        _TRAPPED_VBIOS_TMP=""
+        trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+        return 1
+    fi
+
+    rm -f "$tmp_xml" "$orig_xml"
+    _TRAPPED_VBIOS_TMP=""
+    trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+
+    log "SUCCESS" "VBIOS injected into VM '$vm_name'."
+    log "WARN" "IMPORTANT: Shut down (not restart) VM '$vm_name' fully for VBIOS to take effect."
+}
+
+remove_vbios_from_vm() {
+    local vm_name="$1"
+    local virsh_cmd="$2"
+    local dry="${3:-false}"
+
+    if [[ "$dry" == true ]]; then
+        log "INFO" "[DRY-RUN] Would remove VBIOS injection from VM '$vm_name'."
+        return 0
+    fi
+
+    if ! vm_has_vbios_config "$vm_name" "$virsh_cmd"; then
+        log "SUCCESS" "VM '$vm_name' does not have any VBIOS injection configured. Nothing to remove."
+        return 0
+    fi
+
+    log "INFO" "Removing VBIOS injection from VM '$vm_name'…"
+
+    local tmp_xml orig_xml
+    tmp_xml="$(mktemp)"
+    orig_xml="$(mktemp)"
+    local _TRAPPED_VBIOS_TMP="$tmp_xml $orig_xml"
+    _vbios_cleanup_trap() {
+        for f in ${_TRAPPED_VBIOS_TMP:-}; do
+            rm -f "$f" >/dev/null 2>&1 || true
+        done
+        _TRAPPED_VBIOS_TMP=""
+        trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+    }
+    trap '_vbios_cleanup_trap' INT TERM
+
+    if ! $virsh_cmd dumpxml --inactive "$vm_name" > "$orig_xml" 2>/dev/null; then
+        log "ERROR" "Failed to dump XML for VM '$vm_name'."
+        rm -f "$tmp_xml" "$orig_xml"
+        _TRAPPED_VBIOS_TMP=""
+        trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+        return 1
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$orig_xml" "$tmp_xml" <<'PYEOF'
+import sys, re
+infile, outfile = sys.argv[1], sys.argv[2]
+with open(infile, 'r') as f:
+    content = f.read()
+
+def remove_rom_block(match):
+    block = match.group(0)
+    block = re.sub(r"\s*<rom\s+file\s*=\s*['\"][^'\"]*['\"]\s*/>", "", block)
+    return block
+
+content = re.sub(
+    r"<hostdev[^>]*type\s*=\s*['\"]pci['\"][^>]*>.*?</hostdev>",
+    remove_rom_block,
+    content,
+    flags=re.DOTALL
+)
+
+with open(outfile, 'w') as f:
+    f.write(content)
+PYEOF
+    else
+        log "ERROR" "python3 is required for VBIOS XML removal."
+        rm -f "$tmp_xml" "$orig_xml"
+        _TRAPPED_VBIOS_TMP=""
+        trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+        return 1
+    fi
+
+    if ! $virsh_cmd define "$tmp_xml" 2>/dev/null; then
+        log "ERROR" "Failed to redefine VM '$vm_name' after removing VBIOS."
+        rm -f "$tmp_xml" "$orig_xml"
+        _TRAPPED_VBIOS_TMP=""
+        trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+        return 1
+    fi
+
+    rm -f "$tmp_xml" "$orig_xml"
+    _TRAPPED_VBIOS_TMP=""
+    trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
+
+    log "SUCCESS" "VBIOS removed from VM '$vm_name'."
+}
+
+find_vbios_files() {
+    local dir="${1:-$VBIOS_DIR}"
+    if [[ -d "$dir" ]]; then
+        find "$dir" -maxdepth 1 -type f -name '*.rom' 2>/dev/null | sort
+    fi
+}
+
+select_vbios_file() {
+    local files=()
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && files+=("$f")
+    done < <(find_vbios_files)
+
+    if [[ ${#files[@]} -eq 0 ]]; then
+        printf '%s' ""
+        return
+    fi
+
+    if [[ ${#files[@]} -eq 1 ]]; then
+        printf '%s' "${files[0]}"
+        return
+    fi
+
+    local menu_items=()
+    local i=1
+    for f in "${files[@]}"; do
+        menu_items+=("$i" "$(basename "$f")")
+        i=$((i+1))
+    done
+    menu_items+=("0" "Cancel / Provide path manually")
+
+    local selected_idx
+    selected_idx="$(tui_menu "Select VBIOS" "Which VBIOS file should be injected?" "" "${menu_items[@]}")"
+    if [[ -z "$selected_idx" || "$selected_idx" == "0" ]]; then
+        printf '%s' ""
+        return
+    fi
+    printf '%s' "${files[$((selected_idx-1))]}"
+}
+
+configure_vm_vbios() {
+    local vm_list selected_vm
+    local virsh_cmd="virsh"
+
+    if ! command -v virsh >/dev/null 2>&1; then
+        log "INFO" "virsh not found. Skipping VBIOS VM configuration."
+        return 0
+    fi
+
+    if virsh -c qemu:///system list --all >/dev/null 2>&1; then
+        virsh_cmd="virsh -c qemu:///system"
+    elif virsh -c qemu:///session list --all >/dev/null 2>&1; then
+        virsh_cmd="virsh -c qemu:///session"
+    else
+        log "WARN" "Cannot connect to libvirt. Skipping VBIOS configuration."
+        return 0
+    fi
+
+    log "INFO" "Scanning libvirt virtual machines for VBIOS configuration…"
+    mapfile -t vm_list < <($virsh_cmd list --all --name | grep -v '^$' || true)
+    if [[ ${#vm_list[@]} -eq 0 ]]; then
+        log "WARN" "No libvirt VMs found. Skipping VBIOS configuration."
+        return 0
+    fi
+
+    local selected_vm=""
+    if [[ -n "$VM_NAME" ]]; then
+        local vm_found=false
+        for vm in "${vm_list[@]}"; do
+            if [[ "$vm" == "$VM_NAME" ]]; then
+                vm_found=true
+                break
+            fi
+        done
+        if [[ "$vm_found" == true ]]; then
+            selected_vm="$VM_NAME"
+            log "INFO" "Using explicitly specified VM '$selected_vm' (--vm-name)."
+        else
+            log "WARN" "VM '$VM_NAME' not found. Falling back to selection."
+        fi
+    fi
+
+    if [[ -z "$selected_vm" ]]; then
+        local menu_items=()
+        local vm i=1
+        for vm in "${vm_list[@]}"; do
+            local state vbios_info
+            state="$($virsh_cmd domstate "$vm" 2>/dev/null || echo "unknown")"
+            if vm_has_vbios_config "$vm" "$virsh_cmd"; then
+                vbios_info=" [VBIOS injected]"
+            else
+                vbios_info=" [VBIOS not configured]"
+            fi
+            menu_items+=("$i" "$vm ($state)${vbios_info}")
+            i=$((i+1))
+        done
+        menu_items+=("0" "Skip VBIOS configuration")
+
+        local selected_idx
+        selected_idx="$(tui_menu "Select VM for VBIOS" "Which VM should have VBIOS configured?" "" "${menu_items[@]}")"
+        if [[ -z "$selected_idx" || "$selected_idx" == "0" ]]; then
+            log "INFO" "Skipping VBIOS configuration."
+            return 0
+        fi
+        selected_vm="${vm_list[$((selected_idx-1))]}"
+    fi
+
+    log "INFO" "Targeting VM: $selected_vm"
+
+    local has_gpu=false
+    if $virsh_cmd dumpxml --inactive "$selected_vm" 2>/dev/null | grep -q "type='pci'"; then
+        if $virsh_cmd dumpxml --inactive "$selected_vm" 2>/dev/null | grep -q "<hostdev.*type='pci'"; then
+            has_gpu=true
+        fi
+    fi
+    if [[ "$has_gpu" == false ]]; then
+        log "WARN" "VM '$selected_vm' has no PCI passthrough (GPU) devices. VBIOS injection requires a GPU passthrough block."
+        return 0
+    fi
+
+    if vm_has_vbios_config "$selected_vm" "$virsh_cmd"; then
+        log "SUCCESS" "VM '$selected_vm' already has VBIOS injected."
+        local action
+        if [[ "$YES" == true ]]; then
+            action="keep"
+        elif [[ "$TUI_BACKEND" != "none" && "$TUI_BACKEND" != "" && "$DRY_RUN" != true ]]; then
+            action="$(tui_menu "VBIOS Configuration" "VM '$selected_vm' already has VBIOS injected. What do you want to do?" "" \
+                "keep" "Keep current VBIOS configuration" \
+                "remove" "Remove VBIOS configuration")"
+        else
+            action="keep"
+        fi
+        case "$action" in
+            remove)
+                remove_vbios_from_vm "$selected_vm" "$virsh_cmd" "$DRY_RUN"
+                ;;
+            keep|"")
+                log "INFO" "Kept existing VBIOS configuration on '$selected_vm'."
+                ;;
+        esac
+    else
+        log "INFO" "VM '$selected_vm' does not have VBIOS configured."
+        local action
+        if [[ "$YES" == true ]]; then
+            action="inject"
+        elif [[ "$TUI_BACKEND" != "none" && "$TUI_BACKEND" != "" && "$DRY_RUN" != true ]]; then
+            action="$(tui_menu "VBIOS Configuration" "Inject VBIOS into GPU passthrough on VM '$selected_vm'?" "" \
+                "inject" "Inject VBIOS (recommended for headless boot)" \
+                "skip" "Skip VBIOS configuration")"
+        else
+            if [[ "$DRY_RUN" == true ]]; then
+                action="inject"
+            else
+                log "INFO" "VBIOS not configured. Use --inject-vbios or run interactively to inject."
+                action="skip"
+            fi
+        fi
+        case "$action" in
+        inject)
+                local rom_path=""
+                if [[ -n "$VBIOS_FILE" && -f "$VBIOS_FILE" ]]; then
+                    rom_path="$VBIOS_FILE"
+                    log "INFO" "Using VBIOS file from --vbios-path: $rom_path"
+                else
+                    rom_path="$(select_vbios_file)"
+                    if [[ -z "$rom_path" ]]; then
+                        local found_files
+                        found_files="$(find_vbios_files | head -n 1)"
+                        if [[ -n "$found_files" && -f "$found_files" ]]; then
+                            log "INFO" "Auto-selecting first VBIOS file: $found_files"
+                            rom_path="$found_files"
+                        else
+                            log "WARN" "No VBIOS .rom files found in $VBIOS_DIR."
+                            log "INFO" "Dump a VBIOS first with: sudo $SCRIPT_NAME --dump-vbios"
+                            log "INFO" "Or specify a path with --vbios-path <file>"
+                            return 0
+                        fi
+                    fi
+                fi
+
+                if [[ -z "$rom_path" || ! -f "$rom_path" ]]; then
+                    log "WARN" "No valid VBIOS file selected. Skipping injection."
+                    return 0
+                fi
+
+                # Pre-check: if already injected with same ROM, skip
+                if vm_vbios_is_same_rom "$selected_vm" "$virsh_cmd" "$rom_path"; then
+                    log "SUCCESS" "VM '$selected_vm' already has VBIOS '$rom_path' injected."
+                else
+                    inject_vbios_to_vm "$selected_vm" "$virsh_cmd" "$rom_path" "$DRY_RUN"
+                fi
+                ;;
+            skip|"")
+                log "INFO" "Skipped VBIOS configuration for '$selected_vm'."
+                ;;
+        esac
+    fi
+}
+
+do_vbios_inject_standalone() {
+    local action="$1"
+
+    if [[ $EUID -ne 0 ]]; then
+        log "ERROR" "This action must be run as root. Please use sudo."
+        exit 1
+    fi
+
+    local virsh_cmd="virsh"
+    if ! command -v virsh >/dev/null 2>&1; then
+        log "ERROR" "virsh not found. Cannot configure VBIOS."
+        exit 1
+    fi
+
+    if virsh -c qemu:///system list --all >/dev/null 2>&1; then
+        virsh_cmd="virsh -c qemu:///system"
+    elif virsh -c qemu:///session list --all >/dev/null 2>&1; then
+        virsh_cmd="virsh -c qemu:///session"
+    else
+        log "ERROR" "Cannot connect to libvirt. Cannot configure VBIOS."
+        exit 1
+    fi
+
+    local vm_list selected_vm
+    mapfile -t vm_list < <($virsh_cmd list --all --name | grep -v '^$' || true)
+    if [[ ${#vm_list[@]} -eq 0 ]]; then
+        log "ERROR" "No libvirt VMs found."
+        exit 1
+    fi
+
+    selected_vm=""
+    if [[ -n "$VM_NAME" ]]; then
+        for vm in "${vm_list[@]}"; do
+            if [[ "$vm" == "$VM_NAME" ]]; then
+                selected_vm="$VM_NAME"
+                break
+            fi
+        done
+        if [[ -z "$selected_vm" ]]; then
+            log "ERROR" "VM '$VM_NAME' not found."
+            exit 1
+        fi
+    else
+        local menu_items=()
+        local vm i=1
+        for vm in "${vm_list[@]}"; do
+            local state vbios_info
+            state="$($virsh_cmd domstate "$vm" 2>/dev/null || echo "unknown")"
+            if vm_has_vbios_config "$vm" "$virsh_cmd"; then
+                vbios_info=" [VBIOS injected]"
+            else
+                vbios_info=" [VBIOS not configured]"
+            fi
+            menu_items+=("$i" "$vm ($state)${vbios_info}")
+            i=$((i+1))
+        done
+        menu_items+=("0" "Cancel")
+
+        local selected_idx
+        selected_idx="$(tui_menu "Select VM for VBIOS" "Which VM should be modified?" "" "${menu_items[@]}")"
+        if [[ -z "$selected_idx" || "$selected_idx" == "0" ]]; then
+            log "INFO" "Cancelled."
+            exit 0
+        fi
+        selected_vm="${vm_list[$((selected_idx-1))]}"
+    fi
+
+    if [[ "$action" == "inject" ]]; then
+        local rom_path=""
+        if [[ -n "$VBIOS_FILE" && -f "$VBIOS_FILE" ]]; then
+            rom_path="$VBIOS_FILE"
+        else
+            rom_path="$(select_vbios_file)"
+            if [[ -z "$rom_path" ]]; then
+                local found_files
+                found_files="$(find_vbios_files | head -n 1)"
+                if [[ -n "$found_files" && -f "$found_files" ]]; then
+                    rom_path="$found_files"
+                else
+                    log "ERROR" "No VBIOS .rom files found in $VBIOS_DIR. Use --dump-vbios or --vbios-path."
+                    exit 1
+                fi
+            fi
+        fi
+
+        # Pre-check: if already injected with same ROM, skip
+        if vm_vbios_is_same_rom "$selected_vm" "$virsh_cmd" "$rom_path"; then
+            log "SUCCESS" "VM '$selected_vm' already has VBIOS '$rom_path' injected."
+            exit 0
+        fi
+
+        inject_vbios_to_vm "$selected_vm" "$virsh_cmd" "$rom_path" "$DRY_RUN"
+    else
+        if ! vm_has_vbios_config "$selected_vm" "$virsh_cmd"; then
+            log "WARN" "VM '$selected_vm' does not have VBIOS configured. Nothing to remove."
+            exit 0
+        fi
+        remove_vbios_from_vm "$selected_vm" "$virsh_cmd" "$DRY_RUN"
+    fi
+}
+
 remove_shmem_from_vm() {
     local vm_name="$1"
     local virsh_cmd="$2"
@@ -1707,6 +2462,7 @@ do_install() {
     configure_libvirt_vm
     resize_shared_memory "${LG_SHMEM_SIZE:-64}"
     configure_vm_rebar
+    configure_vm_vbios
     install_shell_completions
     create_desktop_entry
 
@@ -1885,6 +2641,15 @@ do_uninstall() {
                 log "WARN" "You may want to remove this manually in virt-manager if ReBAR is no longer needed."
             fi
         done < <($virsh_uninstall list --all --name 2>/dev/null || true)
+
+        # VBIOS orphan check
+        while IFS= read -r vm_name; do
+            [[ -z "$vm_name" ]] && continue
+            if $virsh_uninstall dumpxml "$vm_name" 2>/dev/null | grep -q "<rom file="; then
+                log "WARN" "VM '$vm_name' still has VBIOS ROM injection configured."
+                log "WARN" "You may want to remove this manually in virt-manager if VBIOS is no longer needed."
+            fi
+        done < <($virsh_uninstall list --all --name 2>/dev/null || true)
     fi
 
     log "SUCCESS" "Looking Glass has been successfully uninstalled."
@@ -1942,6 +2707,22 @@ parse_args() {
                 do_rebar_standalone "disable"
                 exit 0
                 ;;
+            --dump-vbios)
+                do_vbios_dump_standalone
+                exit 0
+                ;;
+            --inject-vbios)
+                do_vbios_inject_standalone "inject"
+                exit 0
+                ;;
+            --remove-vbios)
+                do_vbios_inject_standalone "remove"
+                exit 0
+                ;;
+            --vbios-path)
+                VBIOS_FILE="$2"
+                shift 2
+                ;;
             --help|-h)
                 cat <<EOF
 Usage: sudo ./${SCRIPT_NAME} [OPTIONS]
@@ -1959,6 +2740,10 @@ Options:
   --shmem-size <MB>      Shared-memory pool size (default: 64). Common: 64 (1080p), 128 (1440p), 256 (4K), 512 (UW 4K).
   --enable-rebar         Enable ReBAR 64-bit MMIO (64GB aperture) on a VM.
   --disable-rebar        Disable ReBAR 64-bit MMIO configuration from a VM.
+  --dump-vbios           Dump GPU VBIOS ROM from a PCI passthrough GPU.
+  --inject-vbios         Inject VBIOS ROM into a VM's GPU passthrough block.
+  --remove-vbios         Remove VBIOS ROM injection from a VM's GPU passthrough.
+  --vbios-path <file>    Path to a VBIOS .rom file for injection.
   --help, -h             Show this help text.
 EOF
                 exit 0

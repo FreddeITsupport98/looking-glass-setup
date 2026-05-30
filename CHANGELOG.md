@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+- **2026-05-30 18:32** — Hardened VBIOS idempotency and improved VFIO GPU detection.
+  - `detect_vfio_gpus()` now filters for GPUs bound to `vfio-pci` by reading `/sys/bus/pci/devices/<addr>/driver` instead of listing all VGA/3D controllers.
+  - Added `detect_all_gpus()` (legacy behavior) as a fallback when no vfio-pci GPUs are found.
+  - Added `get_gpu_driver_name()`, `gpu_is_vfio()`, `get_vm_vbios_rom_path()`, `vm_vbios_is_same_rom()`, and `pci_hostdev_has_rom_block()` helper functions.
+  - `inject_vbios_to_vm()` now pre-checks `vm_vbios_is_same_rom()` before writing XML; if the exact same ROM path is already injected, it skips re-definition and logs success.
+  - `remove_vbios_from_vm()` now pre-checks `vm_has_vbios_config()` and exits cleanly if nothing is configured.
+  - `do_vbios_dump_standalone()` displays the driver name next to each GPU in the TUI menu; vfio-pci passthrough GPUs are tagged `[PASSTHROUGH]`, others show their actual driver.
+  - `dump_vbios()` detects when a GPU is bound to `vfio-pci` and prints specific rebinding instructions instead of a generic failure message.
+  - `do_vbios_inject_standalone()` and `configure_vm_vbios()` both check `vm_vbios_is_same_rom()` before injection, preventing accidental re-injection of the same ROM.
+
+- **2026-05-30 18:22** — Added VBIOS ROM injection support for headless GPU passthrough VMs.
+  - New functions `detect_vfio_gpus()`, `dump_vbios()`, `vm_has_vbios_config()`, `inject_vbios_to_vm()`, `remove_vbios_from_vm()`, `find_vbios_files()`, `select_vbios_file()`, `configure_vm_vbios()`, and `do_vbios_dump_standalone()` / `do_vbios_inject_standalone()`.
+  - `dump_vbios()` reads the GPU VBIOS ROM from `/sys/bus/pci/devices/<addr>/rom`, validates the dump size, and stores it under `/var/lib/libvirt/vbios/`.
+  - `inject_vbios_to_vm()` uses python3 to parse the VM XML and insert `<rom file='...'/>` into every `<hostdev type='pci'>` block. If a `<rom>` tag already exists, it replaces the path.
+  - `remove_vbios_from_vm()` removes `<rom file='...'/>` from PCI hostdev blocks using the same python3 XML transform.
+  - `configure_vm_vbios()` runs in the install pipeline after ReBAR. It checks whether the VM already has a VBIOS `<rom>` tag. If yes, offers keep/remove; if no, offers inject/skip. It also auto-detects VBIOS files in `/var/lib/libvirt/vbios/` and presents a TUI selector when multiple exist.
+  - New CLI flags: `--dump-vbios`, `--inject-vbios`, `--remove-vbios`, `--vbios-path <file>`.
+  - New TUI menu items: "Dump GPU VBIOS", "Inject VBIOS to VM", "Remove VBIOS from VM".
+  - Uninstaller scans for orphan `<rom file=` configurations and warns if found.
+
 - **2026-05-29 19:04** — Added ReBAR 64-bit MMIO VM configuration support.
   - New functions `vm_has_rebar_config()`, `enable_vm_rebar()`, `disable_vm_rebar()`, `configure_vm_rebar()`, and `do_rebar_standalone()`.
   - Adds `xmlns:qemu` namespace to `<domain>` if missing, and inserts `<qemu:commandline>` with `-fw_cfg opt/ovmf/X-PciMmio64Mb,string=65536` before `</domain>`.

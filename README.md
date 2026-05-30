@@ -51,7 +51,7 @@ sudo looking-glass-setup --create-shortcut
 
 ```
 Usage: sudo ./look-setup.sh [OPTIONS]
-
+```
 Options:
   --install-script       Copy this script to /usr/local/bin/looking-glass-setup.
   --self-remove          Remove the installed script from /usr/local/bin/looking-glass-setup.
@@ -65,6 +65,10 @@ Options:
   --shmem-size <MB>      Shared-memory pool size (default: 64). Common: 64 (1080p), 128 (1440p), 256 (4K), 512 (UW 4K).
   --enable-rebar         Enable ReBAR 64-bit MMIO (64GB aperture) on a VM.
   --disable-rebar        Disable ReBAR 64-bit MMIO configuration from a VM.
+  --dump-vbios           Dump GPU VBIOS ROM from a PCI passthrough GPU.
+  --inject-vbios         Inject VBIOS ROM into a VM's GPU passthrough block.
+  --remove-vbios         Remove VBIOS ROM injection from a VM's GPU passthrough.
+  --vbios-path <file>    Path to a VBIOS .rom file for injection.
   --help, -h             Show this help text.
 ```
 
@@ -113,7 +117,9 @@ When you run the script it follows a strict pipeline:
 
 11. **ReBAR VM Configuration (`configure_vm_rebar`)** — Prompts to enable or disable ReBAR 64-bit MMIO on the target VM. When enabled, the script adds `xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0"` to the `<domain>` element and inserts `<qemu:commandline>` with `-fw_cfg opt/ovmf/X-PciMmio64Mb,string=65536` between `</devices>` and `</domain>`. This creates a 64GB PCI MMIO aperture so large GPUs (e.g., 16GB with ReBAR) do not black-screen. The script first checks whether the VM already has the ReBAR block. If it does, it offers to keep or remove it; if not, it offers to enable or skip. Disable removes the block and cleans up the namespace when no other QEMU elements remain. Both enable and disable use python3 for precise XML transformation, with perl as a fallback. The installer also warns that a full cold shutdown is required for the change to take effect.
 
-12. **Shell Completions (`install_shell_completions`)** — Installs Fish completions to `/usr/share/fish/vendor_completions.d/looking-glass-setup.fish` and Bash completions to `/usr/share/bash-completion/completions/looking-glass-setup`. Both are generated from the current flag list and are cleaned up during `--self-remove`.
+12. **VBIOS ROM Injection (`configure_vm_vbios`)** — Prompts to inject or remove a GPU VBIOS ROM file into the VM's PCI passthrough `<hostdev>` block. This is required for completely headless operation (no VirtIO display attached) on some AMD GPUs that need their physical VBIOS to boot. The script can dump the VBIOS from a physical GPU via `/sys/bus/pci/devices/<addr>/rom` (`--dump-vbios`), stores it in `/var/lib/libvirt/vbios/`, and then injects `<rom file='...'/>` into every `<hostdev type='pci'>` block of the VM XML. If a `<rom>` tag already exists, it replaces the path. Removal deletes the `<rom>` tags. The injection uses python3 regex-based XML transformation and warns that a full cold shutdown is required. During the install pipeline, the script auto-discovers dumped ROM files and presents a TUI selector when multiple exist.
+
+13. **Shell Completions (`install_shell_completions`)** — Installs Fish completions to `/usr/share/fish/vendor_completions.d/looking-glass-setup.fish` and Bash completions to `/usr/share/bash-completion/completions/looking-glass-setup`. Both are generated from the current flag list and are cleaned up during `--self-remove`.
 
 ### Idempotency & Safety
 
@@ -135,6 +141,16 @@ ReBAR (Resizable BAR) allows the CPU to access the entire GPU VRAM instead of a 
 - **Disable** — `sudo ./look-setup.sh --disable-rebar` cleanly removes the injected XML block.
 - **Pre-check** — The script refuses to double-inject; it checks the VM XML for existing ReBAR configuration before adding anything.
 - **Requirement** — You must still enable *Above 4G Decoding* and *Resize BAR* in the VM BIOS / UEFI for this to take effect. The script only prepares the virtual motherboard to accommodate it.
+
+### VBIOS ROM Injection
+
+For completely headless GPU passthrough (no VirtIO display attached), some GPUs (especially AMD RX 6000-series and newer) require their physical VBIOS ROM to be available to the virtual BIOS during boot. Without it, the VM may black-screen because the virtual motherboard cannot initialize the GPU.
+
+- **Dump** — `sudo ./look-setup.sh --dump-vbios` detects GPUs bound to `vfio-pci` via `lspci` + `/sys/bus/pci/devices/<addr>/driver`, lets you pick one in the TUI (tagged `[PASSTHROUGH]` for vfio-pci devices), enables the sysfs ROM node, reads it, validates the size (>64KB), and saves it to `/var/lib/libvirt/vbios/vbios_<addr>.rom`. If no vfio-pci GPUs are found, it falls back to all VGA/3D controllers. If the selected GPU is bound to `vfio-pci`, the script prints specific rebinding instructions because the ROM sysfs node is disabled under that driver.
+- **Inject** — `sudo ./look-setup.sh --inject-vbios` (or via install flow / TUI) scans for `.rom` files in `/var/lib/libvirt/vbios/` and inserts `<rom file='...'/>` into every PCI `<hostdev>` block of the VM XML. If a `<rom>` tag already exists, it replaces the path. Before writing, the script checks whether the exact same ROM path is already configured; if so, it skips re-definition and reports success.
+- **Remove** — `sudo ./look-setup.sh --remove-vbios` deletes the `<rom file='...'/>` tags from all PCI `<hostdev>` blocks. If no VBIOS is configured, it exits cleanly with an informative message.
+- **Pre-check** — The install pipeline checks whether the VM already has a VBIOS `<rom>` tag. If yes, it offers keep/remove; if no, it offers inject/skip. It also verifies the VM actually has a PCI passthrough device before offering injection. The standalone `--inject-vbios` path also skips if the same ROM is already present.
+- **Requirement** — A full cold shutdown (not restart) of the VM is required after injection for the ROM to be read by the virtual BIOS.
 
 ### Uninstall Safety
 

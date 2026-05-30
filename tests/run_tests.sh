@@ -64,6 +64,10 @@ assert_contains "$out" "--self-remove" "--help mentions --self-remove"
 assert_contains "$out" "--create-shortcut" "--help mentions --create-shortcut"
 assert_contains "$out" "--enable-rebar" "--help mentions --enable-rebar"
 assert_contains "$out" "--disable-rebar" "--help mentions --disable-rebar"
+assert_contains "$out" "--dump-vbios" "--help mentions --dump-vbios"
+assert_contains "$out" "--inject-vbios" "--help mentions --inject-vbios"
+assert_contains "$out" "--remove-vbios" "--help mentions --remove-vbios"
+assert_contains "$out" "--vbios-path" "--help mentions --vbios-path"
 
 # Test: unknown option exits with error
 out=$(bash "$SCRIPT" --bogus 2>&1 || true)
