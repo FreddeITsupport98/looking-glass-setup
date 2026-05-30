@@ -49,7 +49,7 @@ log() {
         ERROR)   color="${C_RED}"    ; prefix="[ERROR]" ;;
     esac
 
-    printf "${color}%s %s${C_NC}\n" "$prefix" "$msg"
+    printf "${color}%s %s${C_NC}\n" "$prefix" "$msg" >&2
 
     if [[ "$DRY_RUN" == false ]]; then
         timestamp="[$(date +'%Y-%m-%d %H:%M:%S')]"
@@ -394,7 +394,6 @@ show_main_menu() {
             ;;
         dump_vbios)
             do_vbios_dump_standalone
-            exit 0
             ;;
         inject_vbios)
             if [[ $EUID -ne 0 ]]; then
@@ -805,7 +804,7 @@ resize_shared_memory() {
 
     log "INFO" "Resizing shared-memory file to ${size}MB for VM compatibility…"
     if [[ "$DRY_RUN" == true ]]; then
-        log "INFO" "[DRY-RUN] Would truncate /dev/shm/looking-glass to ${size}MB and set permissions."
+        log "INFO" "[DRY-RUN] Would resize /dev/shm/looking-glass to ${size}MB and set permissions."
         return 0
     fi
 
@@ -813,18 +812,33 @@ resize_shared_memory() {
         touch /dev/shm/looking-glass
     fi
 
-    truncate -s "${size}M" /dev/shm/looking-glass
-    chown "$qemu_user:$qemu_group" /dev/shm/looking-glass
-    chmod 666 /dev/shm/looking-glass
+    local resized=false
+    if truncate -s "${size}M" /dev/shm/looking-glass 2>/dev/null; then
+        resized=true
+    elif fallocate -l "${size}M" /dev/shm/looking-glass 2>/dev/null; then
+        resized=true
+    else
+        log "WARN" "Failed to resize /dev/shm/looking-glass (it may be in use by a running VM). Try shutting down the VM and re-running."
+    fi
+
+    if [[ -e /dev/shm/looking-glass ]]; then
+        chown "$qemu_user:$qemu_group" /dev/shm/looking-glass 2>/dev/null || true
+        chmod 666 /dev/shm/looking-glass 2>/dev/null || true
+    fi
 
     if command -v getenforce >/dev/null 2>&1 && command -v chcon >/dev/null 2>&1; then
         local selinux_state
         selinux_state="$(getenforce)"
         if [[ "$selinux_state" != "Disabled" ]]; then
-            chcon -t svirt_tmpfs_t /dev/shm/looking-glass || true
+            chcon -t svirt_tmpfs_t /dev/shm/looking-glass 2>/dev/null || true
         fi
     fi
-    log "SUCCESS" "Shared-memory file resized to ${size}MB and permissions applied."
+
+    if [[ "$resized" == true ]]; then
+        log "SUCCESS" "Shared-memory file resized to ${size}MB and permissions applied."
+    else
+        log "WARN" "Shared-memory resize incomplete — VM may fail to start. Fix permissions or stop the VM, then re-run."
+    fi
 }
 
 setup_security() {
@@ -985,8 +999,9 @@ enable_vm_rebar() {
     orig_xml="$(mktemp)"
     local _TRAPPED_REBAR_TMP="$tmp_xml $orig_xml"
     _rebar_cleanup_trap() {
-        for f in ${_TRAPPED_REBAR_TMP:-}; do
-            rm -f "$f" >/dev/null 2>&1 || true
+        local _f
+        for _f in "$tmp_xml" "$orig_xml"; do
+            [[ -n "$_f" ]] && rm -f "$_f" >/dev/null 2>&1 || true
         done
         _TRAPPED_REBAR_TMP=""
         trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
@@ -1070,8 +1085,9 @@ disable_vm_rebar() {
     orig_xml="$(mktemp)"
     local _TRAPPED_REBAR_TMP="$tmp_xml $orig_xml"
     _rebar_cleanup_trap() {
-        for f in ${_TRAPPED_REBAR_TMP:-}; do
-            rm -f "$f" >/dev/null 2>&1 || true
+        local _f
+        for _f in "$tmp_xml" "$orig_xml"; do
+            [[ -n "$_f" ]] && rm -f "$_f" >/dev/null 2>&1 || true
         done
         _TRAPPED_REBAR_TMP=""
         trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
@@ -1377,10 +1393,6 @@ get_gpu_driver_name() {
     fi
 }
 
-gpu_is_vfio() {
-    local pci_addr="$1"
-    [[ "$(get_gpu_driver_name "$pci_addr")" == "vfio-pci" ]]
-}
 
 get_vm_vbios_rom_path() {
     local vm_name="$1"
@@ -1424,26 +1436,6 @@ vm_vbios_is_same_rom() {
     return 1
 }
 
-pci_hostdev_has_rom_block() {
-    local xml="$1"
-    if command -v python3 >/dev/null 2>&1; then
-        python3 -c "
-import sys, re
-xml = sys.argv[1]
-matches = re.findall(r\"<hostdev[^>]*type\\s*=\\s*['\\\"]pci['\\\"][^>]*>.*?</hostdev>\", xml, flags=re.DOTALL)
-has_rom = False
-for m in matches:
-    if re.search(r\"<rom\\s+file\\s*=\\s*['\\\"][^'\\\"]*['\\\"]\\s*/>\", m):
-        has_rom = True
-    else:
-        has_rom = False
-        break
-print('yes' if has_rom else 'no')
-" "$xml" 2>/dev/null || echo "no"
-    else
-        echo "no"
-    fi
-}
 
 dump_vbios() {
     local pci_addr="$1"
@@ -1577,16 +1569,6 @@ do_vbios_dump_standalone() {
     exit 0
 }
 
-vm_has_vbios_config() {
-    local vm_name="$1"
-    local virsh_cmd="$2"
-    local xml
-    xml="$($virsh_cmd dumpxml --inactive "$vm_name" 2>/dev/null || true)"
-    if [[ "$xml" == *"<hostdev"* && "$xml" == *"type='pci'"* && "$xml" == *"<rom file="* ]]; then
-        return 0
-    fi
-    return 1
-}
 
 inject_vbios_to_vm() {
     local vm_name="$1"
@@ -1612,8 +1594,9 @@ inject_vbios_to_vm() {
     orig_xml="$(mktemp)"
     local _TRAPPED_VBIOS_TMP="$tmp_xml $orig_xml"
     _vbios_cleanup_trap() {
-        for f in ${_TRAPPED_VBIOS_TMP:-}; do
-            rm -f "$f" >/dev/null 2>&1 || true
+        local _f
+        for _f in "$tmp_xml" "$orig_xml"; do
+            [[ -n "$_f" ]] && rm -f "$_f" >/dev/null 2>&1 || true
         done
         _TRAPPED_VBIOS_TMP=""
         trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
@@ -1699,8 +1682,9 @@ remove_vbios_from_vm() {
     orig_xml="$(mktemp)"
     local _TRAPPED_VBIOS_TMP="$tmp_xml $orig_xml"
     _vbios_cleanup_trap() {
-        for f in ${_TRAPPED_VBIOS_TMP:-}; do
-            rm -f "$f" >/dev/null 2>&1 || true
+        local _f
+        for _f in "$tmp_xml" "$orig_xml"; do
+            [[ -n "$_f" ]] && rm -f "$_f" >/dev/null 2>&1 || true
         done
         _TRAPPED_VBIOS_TMP=""
         trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
@@ -2075,7 +2059,9 @@ remove_shmem_from_vm() {
     tmp_xml="$(mktemp)"
     _TRAPPED_TMP_XML="$tmp_xml"
     _trapped_cleanup() {
-        [[ -n "${_TRAPPED_TMP_XML:-}" ]] && rm -f "$_TRAPPED_TMP_XML" >/dev/null 2>&1 || true
+        if [[ -n "${_TRAPPED_TMP_XML:-}" ]]; then
+            rm -f "$_TRAPPED_TMP_XML" >/dev/null 2>&1 || true
+        fi
         _TRAPPED_TMP_XML=""
         trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
     }
@@ -2145,7 +2131,9 @@ attach_shmem_to_vm() {
     tmp_xml="$(mktemp)"
     _TRAPPED_TMP_XML="$tmp_xml"
     _trapped_cleanup() {
-        [[ -n "${_TRAPPED_TMP_XML:-}" ]] && rm -f "$_TRAPPED_TMP_XML" >/dev/null 2>&1 || true
+        if [[ -n "${_TRAPPED_TMP_XML:-}" ]]; then
+            rm -f "$_TRAPPED_TMP_XML" >/dev/null 2>&1 || true
+        fi
         _TRAPPED_TMP_XML=""
         trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
     }
@@ -2412,7 +2400,7 @@ do_install() {
                 if [[ "$DRY_RUN" == true ]]; then
                     log "INFO" "[DRY-RUN] Would install Fedora build deps and compile from source."
                 else
-            local fedora_deps=(cmake gcc gcc-c++ git make pkgconf ninja-build mesa-libEGL-devel sdl2-compat-devel SDL2_ttf-devel fontconfig-devel gmp-devel libglvnd-devel libX11-devel libXcursor-devel libXext-devel libXfixes-devel libXi-devel libXinerama-devel libXpresent-devel libXrandr-devel libxkbcommon-devel libXScrnSaver-devel wayland-devel wayland-protocols-devel pipewire-devel pulseaudio-libs-devel libsamplerate-devel nettle-devel libzstd-devel binutils-devel spice-protocol)
+                    local fedora_deps=(cmake gcc gcc-c++ git make pkgconf ninja-build mesa-libEGL-devel sdl2-compat-devel SDL2_ttf-devel fontconfig-devel gmp-devel libglvnd-devel libX11-devel libXcursor-devel libXext-devel libXfixes-devel libXi-devel libXinerama-devel libXpresent-devel libXrandr-devel libxkbcommon-devel libXScrnSaver-devel wayland-devel wayland-protocols-devel pipewire-devel pulseaudio-libs-devel libsamplerate-devel nettle-devel libzstd-devel binutils-devel spice-protocol)
                     if dnf install -y "${fedora_deps[@]}"; then
                         compile_from_source
                     else
@@ -2692,10 +2680,18 @@ parse_args() {
                 shift
                 ;;
             --vm-name)
+                if [[ -z "${2:-}" || "${2:0:1}" == "-" ]]; then
+                    log "ERROR" "--vm-name requires a value."
+                    exit 1
+                fi
                 VM_NAME="$2"
                 shift 2
                 ;;
             --shmem-size)
+                if [[ -z "${2:-}" || "${2:0:1}" == "-" ]]; then
+                    log "ERROR" "--shmem-size requires a value."
+                    exit 1
+                fi
                 LG_SHMEM_SIZE="$2"
                 shift 2
                 ;;
@@ -2709,7 +2705,6 @@ parse_args() {
                 ;;
             --dump-vbios)
                 do_vbios_dump_standalone
-                exit 0
                 ;;
             --inject-vbios)
                 do_vbios_inject_standalone "inject"
@@ -2720,6 +2715,10 @@ parse_args() {
                 exit 0
                 ;;
             --vbios-path)
+                if [[ -z "${2:-}" || "${2:0:1}" == "-" ]]; then
+                    log "ERROR" "--vbios-path requires a value."
+                    exit 1
+                fi
                 VBIOS_FILE="$2"
                 shift 2
                 ;;
