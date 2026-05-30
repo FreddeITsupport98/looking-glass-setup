@@ -181,6 +181,8 @@ install_script() {
         log "INFO" "  sudo looking-glass-setup --dump-vbios      # Dump GPU VBIOS ROM"
         log "INFO" "  sudo looking-glass-setup --inject-vbios  # Inject VBIOS into VM GPU passthrough"
         log "INFO" "  sudo looking-glass-setup --remove-vbios  # Remove VBIOS from VM GPU passthrough"
+    log "INFO" "  sudo looking-glass-setup --fix-shmem    # Resize shmem to match VM and fix perms"
+        log "INFO" "  sudo looking-glass-setup --help         # Show full help"
     else
         log "ERROR" "Failed to copy script to $INSTALLED_PATH. Are you root?"
         return 1
@@ -305,6 +307,7 @@ complete -c looking-glass-setup -l dump-vbios -d "Dump GPU VBIOS ROM"
 complete -c looking-glass-setup -l inject-vbios -d "Inject VBIOS ROM into VM GPU passthrough"
 complete -c looking-glass-setup -l remove-vbios -d "Remove VBIOS ROM from VM GPU passthrough"
 complete -c looking-glass-setup -l vbios-path -d "Path to VBIOS .rom file"
+complete -c looking-glass-setup -l fix-shmem -d "Resize /dev/shm/looking-glass to match VM ivshmem size"
 complete -c looking-glass-setup -l help -s h -d "Show help"
 FISH
             log "SUCCESS" "Fish completions installed to $fish_dir"
@@ -325,7 +328,7 @@ FISH
             cat > "$bash_dir/looking-glass-setup" <<'BASH'
 _looking_glass_setup_completions() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
-    local opts="--install-script --self-remove --create-shortcut --uninstall --eject --install-completions --dry-run --no-tui --yes -y --vm-name --shmem-size --enable-rebar --disable-rebar --dump-vbios --inject-vbios --remove-vbios --vbios-path --help -h"
+    local opts="--install-script --self-remove --create-shortcut --uninstall --eject --install-completions --dry-run --no-tui --yes -y --vm-name --shmem-size --enable-rebar --disable-rebar --dump-vbios --inject-vbios --remove-vbios --fix-shmem --vbios-path --help -h"
     COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
 }
 complete -F _looking_glass_setup_completions looking-glass-setup
@@ -351,6 +354,7 @@ show_main_menu() {
     menu_items+=("dump_vbios" "Dump GPU VBIOS")
     menu_items+=("inject_vbios" "Inject VBIOS to VM")
     menu_items+=("remove_vbios" "Remove VBIOS from VM")
+    menu_items+=("fix_shmem" "Fix Shared Memory Mismatch")
     menu_items+=("exit" "Exit")
     choice="$(tui_menu "Looking Glass Manager" "Select an action:" "" "${menu_items[@]}")"
     case "$choice" in
@@ -409,6 +413,14 @@ show_main_menu() {
                 exit 1
             fi
             do_vbios_inject_standalone "remove"
+            exit 0
+            ;;
+        fix_shmem)
+            if [[ $EUID -ne 0 ]]; then
+                log "ERROR" "This action must be run as root. Please use sudo."
+                exit 1
+            fi
+            do_fix_shmem_standalone
             exit 0
             ;;
         exit|"")
@@ -907,10 +919,40 @@ resize_shared_memory() {
     fi
 
     if [[ "$resized" == true ]]; then
-        log "SUCCESS" "Shared-memory file resized to ${size}MB and permissions applied."
+    log "SUCCESS" "Shared-memory file resized to ${size}MB and permissions applied."
     else
         log "WARN" "Shared-memory resize incomplete — VM may fail to start. Fix permissions or stop the VM, then re-run."
     fi
+}
+
+fix_shmem_for_vm() {
+    local vm_name="$1"
+    local virsh_cmd="$2"
+    local vm_size
+    local shmem_file="/dev/shm/looking-glass"
+
+    vm_size="$(get_vm_shmem_size "$vm_name" "$virsh_cmd")"
+    if [[ -z "$vm_size" || "$vm_size" == "0" ]]; then
+        log "WARN" "VM '$vm_name' has no Looking Glass ivshmem device configured."
+        return 1
+    fi
+
+    local current_size=0
+    if [[ -f "$shmem_file" ]]; then
+        current_size="$(stat -c %s "$shmem_file" 2>/dev/null || echo 0)"
+        current_size=$((current_size / 1024 / 1024))
+    fi
+
+    log "INFO" "VM '$vm_name' expects ${vm_size}MB shared memory."
+    log "INFO" "Current backing file ($shmem_file): ${current_size}MB."
+
+    if [[ "$current_size" -ge "$vm_size" ]]; then
+        log "SUCCESS" "Backing file is already large enough (${current_size}MB >= ${vm_size}MB)."
+        return 0
+    fi
+
+    log "WARN" "Backing file is smaller than VM expects. Resizing to ${vm_size}MB and fixing permissions…"
+    resize_shared_memory "$vm_size"
 }
 
 setup_security() {
@@ -1222,6 +1264,77 @@ PYEOF
     trap 'log "WARN" "Interrupted by user."; exit 130' INT TERM
 
     log "SUCCESS" "ReBAR 64-bit MMIO disabled on VM '$vm_name'."
+}
+
+do_fix_shmem_standalone() {
+    if [[ $EUID -ne 0 ]]; then
+        log "ERROR" "This action must be run as root. Please use sudo."
+        exit 1
+    fi
+
+    local virsh_cmd="virsh"
+    if ! command -v virsh >/dev/null 2>&1; then
+        log "ERROR" "virsh not found. Cannot fix shared memory."
+        exit 1
+    fi
+
+    if virsh -c qemu:///system list --all >/dev/null 2>&1; then
+        virsh_cmd="virsh -c qemu:///system"
+    elif virsh -c qemu:///session list --all >/dev/null 2>&1; then
+        virsh_cmd="virsh -c qemu:///session"
+    else
+        log "ERROR" "Cannot connect to libvirt."
+        exit 1
+    fi
+
+    local vm_list
+    mapfile -t vm_list < <($virsh_cmd list --all --name | grep -v '^$' || true)
+    if [[ ${#vm_list[@]} -eq 0 ]]; then
+        log "ERROR" "No libvirt VMs found."
+        exit 1
+    fi
+
+    local selected_vm=""
+    if [[ -n "$VM_NAME" ]]; then
+        for vm in "${vm_list[@]}"; do
+            if [[ "$vm" == "$VM_NAME" ]]; then
+                selected_vm="$VM_NAME"
+                break
+            fi
+        done
+        if [[ -z "$selected_vm" ]]; then
+            log "ERROR" "VM '$VM_NAME' not found."
+            exit 1
+        fi
+    else
+        local menu_items=()
+        local vm i=1
+        for vm in "${vm_list[@]}"; do
+            local state shmem_info
+            state="$($virsh_cmd domstate "$vm" 2>/dev/null || echo "unknown")"
+            local vm_size
+            vm_size="$(get_vm_shmem_size "$vm" "$virsh_cmd")"
+            if [[ -n "$vm_size" && "$vm_size" != "" && "$vm_size" != "0" ]]; then
+                shmem_info=" [ivshmem ${vm_size}MB]"
+            else
+                shmem_info=" [no ivshmem]"
+            fi
+            menu_items+=("$i" "$vm ($state)${shmem_info}")
+            i=$((i+1))
+        done
+        menu_items+=("0" "Cancel")
+
+        local selected_idx
+        selected_idx="$(tui_menu "Fix Shared Memory" "Which VM's ivshmem size should the backing file match?" "" "${menu_items[@]}")"
+        if [[ -z "$selected_idx" || "$selected_idx" == "0" ]]; then
+            log "INFO" "Cancelled."
+            exit 0
+        fi
+        selected_vm="${vm_list[$((selected_idx-1))]}"
+    fi
+
+    fix_shmem_for_vm "$selected_vm" "$virsh_cmd"
+    exit 0
 }
 
 configure_vm_rebar() {
@@ -1682,6 +1795,66 @@ vm_vbios_is_same_rom() {
     return 1
 }
 
+validate_vbios_rom() {
+    local file="$1"
+    local min_size=65536
+
+    if [[ ! -f "$file" ]]; then
+        log "WARN" "VBIOS file $file does not exist."
+        return 1
+    fi
+
+    local size
+    size=$(stat -c %s "$file" 2>/dev/null || echo 0)
+    if [[ "$size" -lt "$min_size" ]]; then
+        log "WARN" "VBIOS file is only ${size} bytes (minimum expected: ${min_size})."
+        return 1
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        if ! python3 -c "
+import sys
+with open('$file', 'rb') as f:
+    data = f.read()
+if data[0:2] != b'\x55\xAA':
+    print('INVALID_HEADER')
+    sys.exit(1)
+if b'PCIR' not in data:
+    print('NO_PCIR')
+    sys.exit(1)
+print('VALID')
+sys.exit(0)
+" 2>/dev/null; then
+            log "WARN" "VBIOS file $file failed structural validation (invalid header or missing PCI data)."
+            return 1
+        fi
+    else
+        log "INFO" "python3 unavailable; skipping deep VBIOS validation."
+    fi
+
+    log "SUCCESS" "VBIOS file $file passed structural validation (${size} bytes)."
+    return 0
+}
+
+dump_vbios_with_progress() {
+    local rom_file="$1"
+    local output_file="$2"
+    local rom_size
+
+    rom_size=$(stat -c %s "$rom_file" 2>/dev/null || echo 0)
+
+    if command -v pv >/dev/null 2>&1; then
+        pv -s "$rom_size" "$rom_file" > "$output_file"
+    elif dd --version 2>/dev/null | grep -q "GNU"; then
+        dd if="$rom_file" of="$output_file" bs=4K status=progress 2>/dev/null
+    else
+        log "INFO" "Copying VBIOS ROM…"
+        if cp "$rom_file" "$output_file" 2>/dev/null; then
+            return 0
+        fi
+        return 1
+    fi
+}
 
 dump_vbios() {
     local pci_addr="$1"
@@ -1725,11 +1898,17 @@ dump_vbios() {
     fi
 
     log "INFO" "Reading VBIOS from $pci_addr…"
-    if cat "$rom_file" > "$output_file" 2>/dev/null; then
+    if dump_vbios_with_progress "$rom_file" "$output_file"; then
         local rom_size
         rom_size="$(stat -c %s "$output_file" 2>/dev/null || echo 0)"
         if [[ "$rom_size" -lt 65536 ]]; then
             log "WARN" "Dumped ROM is only ${rom_size} bytes — likely invalid. Removing."
+            rm -f "$output_file"
+            echo 0 > "$rom_file" 2>/dev/null || true
+            return 1
+        fi
+        if ! validate_vbios_rom "$output_file"; then
+            log "WARN" "Removing invalid VBIOS dump: $output_file"
             rm -f "$output_file"
             echo 0 > "$rom_file" 2>/dev/null || true
             return 1
@@ -2985,6 +3164,10 @@ parse_args() {
                 do_vbios_inject_standalone "remove"
                 exit 0
                 ;;
+            --fix-shmem)
+                do_fix_shmem_standalone
+                exit 0
+                ;;
             --vbios-path)
                 if [[ -z "${2:-}" || "${2:0:1}" == "-" ]]; then
                     log "ERROR" "--vbios-path requires a value."
@@ -3013,6 +3196,7 @@ Options:
   --dump-vbios           Dump GPU VBIOS ROM from a PCI passthrough GPU.
   --inject-vbios         Inject VBIOS ROM into a VM's GPU passthrough block.
   --remove-vbios         Remove VBIOS ROM injection from a VM's GPU passthrough.
+  --fix-shmem            Resize /dev/shm/looking-glass to match VM ivshmem size and fix permissions.
   --vbios-path <file>    Path to a VBIOS .rom file for injection.
   --help, -h             Show this help text.
 EOF
