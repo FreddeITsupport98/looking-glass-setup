@@ -1,4 +1,4 @@
-> 🚀 **Step 0 — VFIO Passthrough Required**
+> 🚀 **Step 1 — VFIO Passthrough Required**
 >
 > If you haven't set up your VFIO GPU passthrough yet, **start here first**:
 > 👉 [FreddeITsupport98/VFIO-passthrough](https://github.com/FreddeITsupport98/VFIO-passthrough)
