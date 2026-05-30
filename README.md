@@ -1,3 +1,12 @@
+> 🚀 **Step 0 — VFIO Passthrough Required**
+>
+> If you haven't set up your VFIO GPU passthrough yet, **start here first**:
+> 👉 [FreddeITsupport98/VFIO-passthrough](https://github.com/FreddeITsupport98/VFIO-passthrough)
+>
+> This Looking Glass setup assumes you already have a working passthrough. Complete the VFIO guide above **before** returning to this repo.
+
+---
+
 # Looking Glass Setup
 
 A comprehensive, idempotent auto-manager for Looking Glass on Linux GPU passthrough (VFIO) setups. Supports Fedora/RHEL, Arch Linux, and Ubuntu/Debian with interactive TUI menus, dry-run mode, and deep safety guards.
