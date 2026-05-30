@@ -1393,6 +1393,180 @@ get_gpu_driver_name() {
     fi
 }
 
+get_vm_gpu_pci_addrs() {
+    local vm_name="$1"
+    local virsh_cmd="$2"
+    local xml
+    xml="$($virsh_cmd dumpxml --inactive "$vm_name" 2>/dev/null || true)"
+    if [[ -z "$xml" ]]; then
+        return 0
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c "
+import sys, re
+xml = sys.argv[1]
+matches = re.findall(r\"<hostdev[^>]*type\\s*=\\s*['\\\"]pci['\\\"][^>]*>.*?</hostdev>\", xml, flags=re.DOTALL)
+for m in matches:
+    addr_match = re.search(r\"domain\\s*=\\s*['\\\"](0x[0-9a-fA-F]+)['\\\"].*?bus\\s*=\\s*['\\\"](0x[0-9a-fA-F]+)['\\\"].*?slot\\s*=\\s*['\\\"](0x[0-9a-fA-F]+)['\\\"].*?function\\s*=\\s*['\\\"](0x[0-9a-fA-F]+)['\\\"]\", m, re.DOTALL)
+    if addr_match:
+        d = addr_match.group(1).replace('0x','').zfill(4)
+        b = addr_match.group(2).replace('0x','').zfill(2)
+        s = addr_match.group(3).replace('0x','').zfill(2)
+        f = addr_match.group(4).replace('0x','')
+        print(f'{d}:{b}:{s}.{f}')
+" "$xml" 2>/dev/null || true
+    fi
+}
+
+is_vm_running() {
+    local vm_name="$1"
+    local virsh_cmd="$2"
+    local state
+    state="$($virsh_cmd domstate "$vm_name" 2>/dev/null || true)"
+    if [[ "$state" == "running" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+rebind_and_dump_vbios() {
+    local pci_addr="$1"
+    local target_dir="${2:-$VBIOS_DIR}"
+    local output_file="$target_dir/vbios_${pci_addr//:/_}.rom"
+    local rom_result=""
+
+    log "INFO" "GPU $pci_addr is bound to vfio-pci. Attempting temporary rebind to extract VBIOS…"
+
+    if [[ ! -d /sys/bus/pci/devices/$pci_addr ]]; then
+        log "WARN" "PCI device $pci_addr not found in sysfs."
+        return 1
+    fi
+
+    # Unbind from vfio-pci
+    if [[ -f /sys/bus/pci/drivers/vfio-pci/unbind ]]; then
+        if ! printf '%s\n' "$pci_addr" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null; then
+            log "WARN" "Failed to unbind $pci_addr from vfio-pci."
+            return 1
+        fi
+        log "INFO" "Unbound $pci_addr from vfio-pci."
+    fi
+
+    # Give the kernel a moment to settle
+    sleep 0.5
+
+    # Try to dump VBIOS (rom sysfs might now be available without a driver)
+    rom_result="$(dump_vbios "$pci_addr" "$target_dir" 2>/dev/null || true)"
+
+    # Rebind back to vfio-pci
+    if [[ -f /sys/bus/pci/drivers/vfio-pci/bind ]]; then
+        if ! printf '%s\n' "$pci_addr" > /sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null; then
+            log "WARN" "Failed to rebind $pci_addr back to vfio-pci."
+            log "WARN" "You may need to run: echo '$pci_addr' > /sys/bus/pci/drivers/vfio-pci/bind"
+            log "WARN" "Or reboot to restore GPU passthrough."
+        else
+            log "SUCCESS" "Rebound $pci_addr to vfio-pci."
+        fi
+    fi
+
+    if [[ -n "$rom_result" && -f "$rom_result" ]]; then
+        printf '%s' "$rom_result"
+        return 0
+    fi
+    return 1
+}
+
+auto_extract_vbios() {
+    local vm_name="$1"
+    local virsh_cmd="$2"
+    local target_dir="$VBIOS_DIR"
+
+    # Idempotency: if a valid ROM already exists, return it
+    local existing
+    existing="$(find_vbios_files "$target_dir" | head -n 1)"
+    if [[ -n "$existing" && -f "$existing" && -s "$existing" ]]; then
+        printf '%s' "$existing"
+        return 0
+    fi
+
+    if ! mkdir -p "$target_dir" 2>/dev/null; then
+        log "WARN" "Cannot create VBIOS directory $target_dir."
+        return 1
+    fi
+
+    # Get PCI addresses of GPUs passed through to this VM
+    local vm_gpus=()
+    while IFS= read -r addr; do
+        [[ -n "$addr" ]] && vm_gpus+=("$addr")
+    done < <(get_vm_gpu_pci_addrs "$vm_name" "$virsh_cmd")
+
+    # If no VM-specific GPUs found, fall back to all system GPUs
+    local candidates=()
+    if [[ ${#vm_gpus[@]} -gt 0 ]]; then
+        candidates=("${vm_gpus[@]}")
+        log "INFO" "Found ${#vm_gpus[@]} GPU passthrough device(s) on VM '$vm_name'."
+    else
+        while IFS= read -r addr; do
+            [[ -n "$addr" ]] && candidates+=("$addr")
+        done < <(detect_all_gpus)
+        log "INFO" "No VM-specific GPU list found; scanning all ${#candidates[@]} VGA/3D controller(s)."
+    fi
+
+    if [[ ${#candidates[@]} -eq 0 ]]; then
+        log "WARN" "No GPUs detected for VBIOS auto-extraction."
+        return 1
+    fi
+
+    local addr drv rom_path
+    # First pass: GPUs bound to native drivers (no rebind needed)
+    for addr in "${candidates[@]}"; do
+        drv="$(get_gpu_driver_name "$addr")"
+        if [[ "$drv" != "vfio-pci" && -n "$drv" ]]; then
+            log "INFO" "Attempting VBIOS dump from $addr (driver: $drv)…"
+            rom_path="$(dump_vbios "$addr" "$target_dir" 2>/dev/null || true)"
+            if [[ -n "$rom_path" && -f "$rom_path" && -s "$rom_path" ]]; then
+                log "SUCCESS" "Auto-extracted VBIOS: $rom_path"
+                printf '%s' "$rom_path"
+                return 0
+            fi
+        fi
+    done
+
+    # Second pass: vfio-pci GPUs (requires temporary rebind)
+    for addr in "${candidates[@]}"; do
+        drv="$(get_gpu_driver_name "$addr")"
+        if [[ "$drv" == "vfio-pci" ]]; then
+            # Skip if the VM is running — rebind would crash it
+            if [[ -n "$vm_name" ]] && is_vm_running "$vm_name" "$virsh_cmd"; then
+                log "WARN" "VM '$vm_name' is running; cannot temporarily rebind GPU $addr."
+                log "INFO" "Shut down the VM first, then re-run VBIOS injection."
+                continue
+            fi
+            # With --yes or TUI, ask for permission; otherwise just warn
+            local proceed=false
+            if [[ "$YES" == true ]]; then
+                proceed=true
+            elif [[ "$TUI_BACKEND" != "none" && "$TUI_BACKEND" != "" ]]; then
+                if tui_yesno "VBIOS Auto-Extract" "GPU $addr is bound to vfio-pci. Temporarily rebind it to extract the VBIOS ROM?"; then
+                    proceed=true
+                fi
+            fi
+            if [[ "$proceed" == true ]]; then
+                rom_path="$(rebind_and_dump_vbios "$addr" "$target_dir" 2>/dev/null || true)"
+                if [[ -n "$rom_path" && -f "$rom_path" && -s "$rom_path" ]]; then
+                    log "SUCCESS" "Auto-extracted VBIOS from $addr: $rom_path"
+                    printf '%s' "$rom_path"
+                    return 0
+                fi
+            else
+                log "INFO" "Skipped temporary rebind for $addr. Use --yes to allow automatic rebind."
+            fi
+        fi
+    done
+
+    log "WARN" "VBIOS auto-extraction failed for all candidate GPUs."
+    return 1
+}
+
 
 get_vm_vbios_rom_path() {
     local vm_name="$1"
@@ -1916,10 +2090,18 @@ configure_vm_vbios() {
                             log "INFO" "Auto-selecting first VBIOS file: $found_files"
                             rom_path="$found_files"
                         else
-                            log "WARN" "No VBIOS .rom files found in $VBIOS_DIR."
-                            log "INFO" "Dump a VBIOS first with: sudo $SCRIPT_NAME --dump-vbios"
-                            log "INFO" "Or specify a path with --vbios-path <file>"
-                            return 0
+                            log "INFO" "No VBIOS .rom files found in $VBIOS_DIR. Attempting auto-extraction from host GPU…"
+                            local _auto_rom
+                            _auto_rom="$(auto_extract_vbios "$selected_vm" "$virsh_cmd" 2>/dev/null || true)"
+                            if [[ -n "$_auto_rom" && -f "$_auto_rom" ]]; then
+                                log "SUCCESS" "Auto-extracted VBIOS selected: $_auto_rom"
+                                rom_path="$_auto_rom"
+                            else
+                                log "WARN" "Auto-extraction failed."
+                                log "INFO" "Dump a VBIOS first with: sudo $SCRIPT_NAME --dump-vbios"
+                                log "INFO" "Or specify a path with --vbios-path <file>"
+                                return 0
+                            fi
                         fi
                     fi
                 fi
@@ -2022,8 +2204,16 @@ do_vbios_inject_standalone() {
                 if [[ -n "$found_files" && -f "$found_files" ]]; then
                     rom_path="$found_files"
                 else
-                    log "ERROR" "No VBIOS .rom files found in $VBIOS_DIR. Use --dump-vbios or --vbios-path."
-                    exit 1
+                    log "INFO" "No VBIOS .rom files found in $VBIOS_DIR. Attempting auto-extraction from host GPU…"
+                    local _auto_rom
+                    _auto_rom="$(auto_extract_vbios "$selected_vm" "$virsh_cmd" 2>/dev/null || true)"
+                    if [[ -n "$_auto_rom" && -f "$_auto_rom" ]]; then
+                        log "SUCCESS" "Auto-extracted VBIOS selected: $_auto_rom"
+                        rom_path="$_auto_rom"
+                    else
+                        log "ERROR" "No VBIOS .rom files found in $VBIOS_DIR and auto-extraction failed. Use --dump-vbios or --vbios-path."
+                        exit 1
+                    fi
                 fi
             fi
         fi
