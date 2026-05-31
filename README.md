@@ -1,3 +1,5 @@
+![Looking Glass Setup](icon/icon.jpg)
+
 > 🚀 **Step 1 — VFIO Passthrough Required**
 >
 > If you haven't set up your VFIO GPU passthrough yet, **start here first**:
