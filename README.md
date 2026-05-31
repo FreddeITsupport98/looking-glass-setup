@@ -1,4 +1,6 @@
-![Looking Glass Setup](icon/icon.jpg)
+<p align="center">
+  <img src="icon/icon.jpg" alt="Looking Glass Setup" width="400">
+</p>
 
 > 🚀 **Step 1 — VFIO Passthrough Required**
 >
