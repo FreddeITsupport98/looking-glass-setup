@@ -1824,7 +1824,7 @@ if b'PCIR' not in data:
     sys.exit(1)
 print('VALID')
 sys.exit(0)
-" 2>/dev/null; then
+" >/dev/null 2>&1; then
             log "WARN" "VBIOS file $file failed structural validation (invalid header or missing PCI data)."
             return 1
         fi
