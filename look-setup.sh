@@ -2847,7 +2847,7 @@ do_install() {
                 if [[ "$DRY_RUN" == true ]]; then
                     log "INFO" "[DRY-RUN] Would install Fedora build deps and compile from source."
                 else
-                    local fedora_deps=(cmake gcc gcc-c++ git make pkgconf ninja-build mesa-libEGL-devel sdl2-compat-devel SDL2_ttf-devel fontconfig-devel gmp-devel libglvnd-devel libX11-devel libXcursor-devel libXext-devel libXfixes-devel libXi-devel libXinerama-devel libXpresent-devel libXrandr-devel libxkbcommon-devel libXScrnSaver-devel wayland-devel wayland-protocols-devel pipewire-devel pulseaudio-libs-devel libsamplerate-devel nettle-devel libzstd-devel binutils-devel spice-protocol)
+                    local fedora_deps=(cmake gcc gcc-c++ git make pkgconf ninja-build mesa-libEGL-devel sdl2-compat-devel SDL2_ttf-devel fontconfig-devel fuse3-devel gmp-devel libglvnd-devel libX11-devel libXcursor-devel libXext-devel libXfixes-devel libXi-devel libXinerama-devel libXpresent-devel libXrandr-devel libxkbcommon-devel libXScrnSaver-devel wayland-devel wayland-protocols-devel pipewire-devel pulseaudio-libs-devel libsamplerate-devel nettle-devel libzstd-devel binutils-devel spice-protocol)
                     if dnf install -y "${fedora_deps[@]}"; then
                         compile_from_source
                     else
@@ -2860,7 +2860,7 @@ do_install() {
     elif command -v pacman >/dev/null 2>&1; then
         log "INFO" "Detected Arch Linux (pacman)"
         run_or_simulate pacman -S --noconfirm --needed base-devel cmake gcc pkgconf sdl2 sdl2_ttf \
-        spice-protocol fontconfig gmp wayland-protocols libx11 libxext libxfixes libxi \
+        spice-protocol fontconfig fuse3 gmp wayland-protocols libx11 libxext libxfixes libxi \
         libxinerama libxss libxcursor libxpresent libxkbcommon libglvnd
         if ! pacman -Q looking-glass >/dev/null 2>&1; then
             if command -v yay >/dev/null 2>&1 && [[ -n "$REAL_USER" && "$REAL_USER" != "root" ]]; then
@@ -2881,7 +2881,7 @@ do_install() {
         log "INFO" "Installing all required build dependencies…"
         run_or_simulate apt-get update
         run_or_simulate apt-get install -y build-essential pkg-config binutils-dev cmake ninja-build fonts-freefont-ttf \
-        libsdl2-dev libsdl2-ttf-dev libspice-protocol-dev libfontconfig1-dev libgmp-dev \
+        libsdl2-dev libsdl2-ttf-dev libspice-protocol-dev libfontconfig1-dev libgmp-dev libfuse3-dev \
         libwayland-dev wayland-protocols libx11-dev libxext-dev libxfixes-dev libxi-dev \
         libxinerama-dev libxss-dev libxcursor-dev libxpresent-dev libxkbcommon-dev \
         libglvnd-dev libegl1-mesa-dev

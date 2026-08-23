@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+- **2026-08-23 21:10** — Fixed missing `fuse3` build dependency that broke Looking Glass client compilation (CMake error: `fuse3>=3.10 not found`).
+  - Added `fuse3-devel` to the Fedora/RHEL build dependency list in `do_install()`.
+  - Added `fuse3` to the Arch Linux `pacman` build dependency list.
+  - Added `libfuse3-dev` to the Ubuntu/Debian `apt` build dependency list.
+  - The Looking Glass client CMake build requires `pkg-config fuse3>=3.10`; without it configuration aborts before compilation begins. All three supported distros were missing this package, so source compilation would fail on every one of them.
+
 - **2026-05-30 18:32** — Hardened VBIOS idempotency and improved VFIO GPU detection.
   - `detect_vfio_gpus()` now filters for GPUs bound to `vfio-pci` by reading `/sys/bus/pci/devices/<addr>/driver` instead of listing all VGA/3D controllers.
   - Added `detect_all_gpus()` (legacy behavior) as a fallback when no vfio-pci GPUs are found.
